@@ -1,0 +1,5 @@
+# Dependencies for linting and type checking.
+# Mirrors the [lint] extra in pyproject.toml.
+# Install with: pip install -r requirements/lint.txt -e .
+pre-commit >= 3.7
+mypy >= 1.10

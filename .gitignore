@@ -1,0 +1,42 @@
+# Byte-compiled / optimized / extension files
+__pycache__/
+*.py[cod]
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# Test and coverage artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Type checking
+.mypy_cache/
+
+# Tooling
+.tox/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Documentation build output
+docs/_build/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Claude Code per-checkout overrides
+CLAUDE.local.md
+.devcontainer/

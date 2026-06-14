@@ -1,0 +1,165 @@
+[build-system]
+requires = [
+    # setuptools >= 77.0 required for PEP 639 license expression support.
+    "setuptools >= 77",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name        = "aiohttp-client-middlewares"
+description = "Reusable client middlewares for aiohttp"
+readme      = "README.rst"
+license      = "Apache-2.0"
+license-files = ["LICENSE"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Framework :: AsyncIO",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Internet :: WWW/HTTP",
+]
+requires-python = ">= 3.10"
+dependencies = [
+  "aiohttp >= 3.12",
+  "yarl >= 1.17.0",
+]
+dynamic = [
+  "version",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest >= 8.0",
+  "pytest-aiohttp >= 1.1.0",
+  "pytest-cov >= 5.0",
+]
+lint = [
+  "pre-commit >= 3.7",
+  "mypy >= 1.10",
+]
+doc = [
+  "sphinx >= 7.0",
+  "aiohttp-theme >= 0.1.7",
+]
+
+[[project.maintainers]]
+name = "aio-libs team"
+email = "team@aiohttp.org"
+
+[project.urls]
+"Homepage"        = "https://github.com/aio-libs/aiohttp-client-middlewares"
+"GitHub: repo"    = "https://github.com/aio-libs/aiohttp-client-middlewares"
+"GitHub: issues"  = "https://github.com/aio-libs/aiohttp-client-middlewares/issues"
+"Docs: Changelog" = "https://github.com/aio-libs/aiohttp-client-middlewares/blob/master/CHANGES.rst"
+
+[tool.setuptools.dynamic]
+version = {attr = "aiohttp_client_middlewares.__version__"}
+
+[tool.setuptools.packages.find]
+include = [
+  "aiohttp_client_middlewares*",
+]
+
+[tool.setuptools.package-data]
+aiohttp_client_middlewares = ["py.typed"]
+
+[tool.towncrier]
+  package = "aiohttp_client_middlewares"
+  filename = "CHANGES.rst"
+  directory = "CHANGES/"
+  title_format = "{version} ({project_date})"
+  template = "CHANGES/.TEMPLATE.rst"
+  issue_format = "{issue}"
+
+  # NOTE: The types are declared because:
+  # NOTE: - there is no mechanism to override just the value of
+  # NOTE:   `tool.towncrier.type.misc.showcontent`;
+  # NOTE: - and, we want to declare extra non-default types for
+  # NOTE:   clarity and flexibility.
+
+  [[tool.towncrier.section]]
+    path = ""
+
+  [[tool.towncrier.type]]
+    # Something we deemed an improper undesired behavior that got corrected
+    # in the release to match pre-agreed expectations.
+    directory = "bugfix"
+    name = "Bug fixes"
+    showcontent = true
+
+  [[tool.towncrier.type]]
+    # New behaviors, public APIs. That sort of stuff.
+    directory = "feature"
+    name = "Features"
+    showcontent = true
+
+  [[tool.towncrier.type]]
+    # Declarations of future API removals and breaking changes in behavior.
+    directory = "deprecation"
+    name = "Deprecations (removal in next major release)"
+    showcontent = true
+
+  [[tool.towncrier.type]]
+    # When something public gets removed in a breaking way. Could be
+    # deprecated in an earlier release.
+    directory = "breaking"
+    name = "Removals and backward incompatible breaking changes"
+    showcontent = true
+
+  [[tool.towncrier.type]]
+    # Notable updates to the documentation structure or build process.
+    directory = "doc"
+    name = "Improved documentation"
+    showcontent = true
+
+  [[tool.towncrier.type]]
+    # Notes for downstreams about unobvious side effects and tooling. Changes
+    # in the test invocation considerations and runtime assumptions.
+    directory = "packaging"
+    name = "Packaging updates and notes for downstreams"
+    showcontent = true
+
+  [[tool.towncrier.type]]
+    # Stuff that affects the contributor experience. e.g. Running tests,
+    # building the docs, setting up the development environment.
+    directory = "contrib"
+    name = "Contributor-facing changes"
+    showcontent = true
+
+  [[tool.towncrier.type]]
+    # Changes that are hard to assign to any of the above categories.
+    directory = "misc"
+    name = "Miscellaneous internal changes"
+    showcontent = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["error"]
+addopts = "-ra"
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+pretty = true
+show_error_codes = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+files = ["aiohttp_client_middlewares"]
+
+[tool.coverage.run]
+source = ["aiohttp_client_middlewares"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+
+[tool.codespell]
+skip = '.git,.venv,*.pdf,*.svg,Makefile,_build,dist,build,*.egg-info,*.lock'

@@ -1,0 +1,5 @@
+# Dependencies for building the documentation.
+# Mirrors the [doc] extra in pyproject.toml.
+# Install with: pip install -r requirements/doc.txt -e .
+sphinx >= 7.0
+aiohttp-theme >= 0.1.7

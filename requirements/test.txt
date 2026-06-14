@@ -1,0 +1,6 @@
+# Dependencies for running the test suite.
+# Mirrors the [test] extra in pyproject.toml.
+# Install with: pip install -r requirements/test.txt -e .
+pytest >= 8.0
+pytest-aiohttp >= 1.1.0
+pytest-cov >= 5.0
