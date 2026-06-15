@@ -11,11 +11,11 @@ Setting up a development environment
 ====================================
 
 Fork and clone the GitHub_ repository, then install the package in
-editable mode together with the development extras:
+editable mode together with the development requirements:
 
 .. code-block:: console
 
-   $ pip install -e ".[test,lint,doc]"
+   $ pip install -e . -r requirements/test.txt -r requirements/lint.txt -r requirements/doc.txt
 
 This installs the runtime dependencies plus everything needed to run the
 tests, the linters, and to build the documentation.
@@ -46,7 +46,7 @@ mypy_:
 .. code-block:: console
 
    $ pre-commit run --all-files
-   $ mypy aiohttp_client_middlewares
+   $ mypy
 
 Code is formatted with black_ (88 columns) and imports are sorted with
 isort_, both enforced by pre-commit, so there is no need to format by
@@ -94,7 +94,7 @@ Pull request flow
 1. Create a branch for your change.
 2. Make the change and add a test that covers it.
 3. Make sure ``pytest``, ``pre-commit run --all-files`` and
-   ``mypy aiohttp_client_middlewares`` all pass.
+   ``mypy`` all pass.
 4. Add a news fragment under ``CHANGES/``.
 5. Open a pull request against the ``master`` branch.
 

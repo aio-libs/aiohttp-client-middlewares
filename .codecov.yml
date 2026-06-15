@@ -8,9 +8,4 @@ comment:
 coverage:
   status:
     project:
-      default:
-        # Don't fail the PR status on small coverage fluctuations.
-        threshold: 1%
     patch:
-      default:
-        informational: true

@@ -16,7 +16,7 @@
 ## Checklist
 
 - [ ] Unit tests for the changes exist and pass (`pytest`).
-- [ ] `pre-commit run --all-files` and `mypy aiohttp_client_middlewares` pass.
+- [ ] `pre-commit run --all-files` and `mypy` pass.
 - [ ] Documentation reflects the changes where applicable.
 - [ ] Add a new news fragment into the `CHANGES/` folder
   * name it `<issue_or_pr_num>.<type>.rst` (e.g. `42.bugfix.rst`)

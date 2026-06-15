@@ -11,14 +11,12 @@ build:
     python: "3.13"
 
 sphinx:
-  # Path to your Sphinx configuration file.
   configuration: docs/conf.py
 
 python:
   install:
+    - requirements: requirements/doc.txt
     - method: pip
       path: .
-      extra_requirements:
-        - doc
 
 ...

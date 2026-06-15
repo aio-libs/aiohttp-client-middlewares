@@ -6,7 +6,7 @@ PACKAGE := aiohttp_client_middlewares
 .PHONY: help
 help:
 	@echo "Available targets:"
-	@echo "  install-dev  Install the package with all extras + pre-commit hooks"
+	@echo "  install-dev  Install the package with all dev requirements + pre-commit hooks"
 	@echo "  fmt          Auto-format the code (black + isort) via pre-commit"
 	@echo "  lint         Run pre-commit on all files and mypy on the package"
 	@echo "  test         Run the test suite with pytest"
@@ -17,7 +17,7 @@ help:
 
 .PHONY: install-dev
 install-dev:
-	$(PIP) install -e ".[test,lint,doc]"
+	$(PIP) install -e . -r requirements/test.txt -r requirements/lint.txt -r requirements/doc.txt
 	pre-commit install
 
 .PHONY: fmt format
@@ -28,7 +28,7 @@ fmt format:
 .PHONY: lint
 lint:
 	pre-commit run --all-files
-	mypy $(PACKAGE)
+	mypy
 
 .PHONY: test
 test:

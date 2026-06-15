@@ -34,21 +34,6 @@ dynamic = [
   "version",
 ]
 
-[project.optional-dependencies]
-test = [
-  "pytest >= 8.0",
-  "pytest-aiohttp >= 1.1.0",
-  "pytest-cov >= 5.0",
-]
-lint = [
-  "pre-commit >= 3.7",
-  "mypy >= 1.10",
-]
-doc = [
-  "sphinx >= 7.0",
-  "aiohttp-theme >= 0.1.7",
-]
-
 [[project.maintainers]]
 name = "aio-libs team"
 email = "team@aiohttp.org"
@@ -144,15 +129,6 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 filterwarnings = ["error"]
 addopts = "-ra"
-
-[tool.mypy]
-python_version = "3.10"
-strict = true
-pretty = true
-show_error_codes = true
-warn_unused_ignores = true
-warn_redundant_casts = true
-files = ["aiohttp_client_middlewares"]
 
 [tool.coverage.run]
 source = ["aiohttp_client_middlewares"]

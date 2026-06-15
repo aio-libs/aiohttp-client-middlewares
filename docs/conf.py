@@ -102,9 +102,6 @@ html_sidebars = {
     ]
 }
 
-# Add any paths that contain custom static files (such as style sheets) here,
-# relative to this directory.
-html_static_path = ["_static"]
 
 # Output file base name for HTML help builder.
 htmlhelp_basename = f"{project}doc"
