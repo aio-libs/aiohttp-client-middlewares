@@ -5,6 +5,10 @@ This middleware implements HTTP Digest Authentication according to RFC 7616,
 providing a more secure alternative to Basic Authentication. It supports all
 standard hash algorithms including MD5, SHA, SHA-256, SHA-512 and their session
 variants, as well as both 'auth' and 'auth-int' quality of protection (qop) options.
+
+Vendored from aiohttp (aiohttp/client_middleware_digest_auth.py), distributed
+under the Apache-2.0 license. Keep in sync with upstream: land behavioural
+fixes in aiohttp first, then re-vendor them here.
 """
 
 import hashlib

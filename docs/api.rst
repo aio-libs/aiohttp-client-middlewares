@@ -40,9 +40,9 @@ Digest authentication
    extra round trip and matches how modern web browsers handle digest
    authentication.
 
-   If the nonce has expired, the server may still respond with a 401 status and
-   ``stale=true``, in which case the middleware automatically retries with the
-   new nonce.
+   If the server rejects the nonce as expired (a second 401, typically with
+   ``stale=true``), the middleware reissues the request once using the
+   refreshed challenge.
 
    To disable preemptive authentication and require a 401 challenge for every
    request, set ``preemptive=False``::

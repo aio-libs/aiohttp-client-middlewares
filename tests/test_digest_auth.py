@@ -1,4 +1,8 @@
-"""Test digest authentication middleware for aiohttp client."""
+"""Test digest authentication middleware for aiohttp client.
+
+Vendored from aiohttp (tests/test_client_middleware_digest_auth.py),
+Apache-2.0; keep in sync with upstream.
+"""
 
 import io
 import re

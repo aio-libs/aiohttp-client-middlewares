@@ -41,9 +41,6 @@ extensions = [
     "sphinx.ext.viewcode",
 ]
 
-# Add any paths that contain templates here, relative to this directory.
-templates_path = ["_templates"]
-
 # The suffix of source filenames.
 source_suffix = ".rst"
 
@@ -71,7 +68,7 @@ autodoc_member_order = "bysource"
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),
     "aiohttp": ("https://docs.aiohttp.org/en/stable/", None),
-    "yarl": ("https://yarl.readthedocs.io/en/stable/", None),
+    "yarl": ("https://yarl.aio-libs.org/en/stable/", None),
 }
 
 
