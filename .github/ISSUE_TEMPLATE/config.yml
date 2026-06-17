@@ -1,0 +1,9 @@
+# Ref: https://docs.github.com/en/communities/using-templates-to-encourage-useful-issues-and-pull-requests/configuring-issue-templates-for-your-repository#configuring-the-template-chooser
+blank_issues_enabled: true
+contact_links:
+- name: 💬 GitHub Discussions
+  url: https://github.com/aio-libs/aiohttp-client-middlewares/discussions
+  about: Please ask and answer usage questions here.
+- name: 💬 Matrix
+  url: https://matrix.to/#/#aio-libs:matrix.org
+  about: Chat with the aio-libs devs and community.

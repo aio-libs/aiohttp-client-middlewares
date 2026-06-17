@@ -1,0 +1,2 @@
+aiohttp-theme==0.1.7
+sphinx==9.1.0

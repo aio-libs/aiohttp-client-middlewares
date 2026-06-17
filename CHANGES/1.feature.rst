@@ -1,0 +1,1 @@
+Initial release providing :class:`~aiohttp_client_middlewares.DigestAuthMiddleware`, vendored from aiohttp core -- by :user:`rodrigobnogueira`.

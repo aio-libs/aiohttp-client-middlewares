@@ -1,0 +1,15 @@
+include LICENSE
+include CHANGES.rst
+include CONTRIBUTING.rst
+include CODE_OF_CONDUCT.md
+include README.rst
+include Makefile
+include .pre-commit-config.yaml
+graft aiohttp_client_middlewares
+graft CHANGES
+graft docs
+graft requirements
+graft tests
+global-exclude *.py[cod]
+global-exclude __pycache__
+prune docs/_build

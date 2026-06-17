@@ -1,0 +1,11 @@
+codecov:
+  branch: master
+
+comment:
+  require_head: false
+  require_base: false
+
+coverage:
+  status:
+    project: true
+    patch: true
