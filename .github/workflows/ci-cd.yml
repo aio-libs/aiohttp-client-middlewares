@@ -180,3 +180,15 @@ jobs:
         # Allow re-running the deploy job after a partial PyPI upload
         # without failing on dists that were already published.
         skip-existing: true
+    - name: Sign the dists with Sigstore
+      uses: sigstore/gh-action-sigstore-python@v3.4.0
+      with:
+        inputs: >-
+          ./dist/*.tar.gz
+          ./dist/*.whl
+    - name: Upload artifact signatures to GitHub Release
+      # This action also updates an existing release (created above) rather
+      # than only creating one, which is what we want here.
+      uses: softprops/action-gh-release@v3
+      with:
+        files: dist/**
