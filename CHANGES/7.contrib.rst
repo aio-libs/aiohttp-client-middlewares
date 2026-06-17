@@ -1,0 +1,3 @@
+Added a GitHub Release step to the release workflow: tagged ``v*`` releases now
+create a GitHub Release with the changelog notes and the built distributions
+attached, alongside the existing PyPI publish -- by :user:`rodrigobnogueira`.
