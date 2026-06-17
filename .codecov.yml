@@ -7,5 +7,5 @@ comment:
 
 coverage:
   status:
-    project:
-    patch:
+    project: true
+    patch: true
