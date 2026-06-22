@@ -121,28 +121,74 @@ jobs:
         if-no-files-found: error
 
   publish-pypi:
-    name: Publish to PyPI
+    name: Publish to PyPI and create a GitHub Release
     runs-on: ubuntu-latest
     timeout-minutes: 10
     needs: [build]
-    # Publish to PyPI only on tag pushes matching v*.
+    # Publish to PyPI and cut a GitHub Release on tag pushes matching v*.
     if: >-
       github.event_name == 'push'
       && startsWith(github.ref, 'refs/tags/v')
     permissions:
+      contents: write  # IMPORTANT: mandatory for creating GitHub Releases
       id-token: write  # IMPORTANT: mandatory for trusted publishing (OIDC)
     environment:
       name: pypi
       url: https://pypi.org/p/aiohttp-client-middlewares
     steps:
+    - name: Checkout
+      uses: actions/checkout@v4
     - name: Download distribution artifact
       uses: actions/download-artifact@v8
       with:
         name: dist
         path: dist
+    - name: Check whether the GitHub Release already exists
+      # Lets a re-run after a partial failure (e.g. a PyPI upload error)
+      # succeed instead of failing because the release/tag already exists.
+      # Only the literal "release not found" reply means "create it"; any
+      # other error (auth, network) re-raises so the job fails loudly.
+      id: gh-release
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        TAG: ${{ github.ref_name }}
+      run: |
+        if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>err; then
+          echo 'exists=true' >> "${GITHUB_OUTPUT}"
+        elif grep -qx 'release not found' err; then
+          echo 'exists=false' >> "${GITHUB_OUTPUT}"
+        else
+          cat err >&2
+          exit 1
+        fi
+    - name: Create the GitHub Release
+      if: steps.gh-release.outputs.exists != 'true'
+      uses: aio-libs/create-release@v1.6.6
+      with:
+        changes_file: CHANGES.rst
+        name: aiohttp-client-middlewares
+        version_file: aiohttp_client_middlewares/__init__.py
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        dist_dir: dist
+        fix_issue_regex: >-
+          :issue:`(\d+)`
+        fix_issue_repl: >-
+          #\1
     - name: Publish 🐍📦 to PyPI
       uses: pypa/gh-action-pypi-publish@release/v1
       with:
         # Allow re-running the deploy job after a partial PyPI upload
         # without failing on dists that were already published.
         skip-existing: true
+    - name: Sign the dists with Sigstore
+      uses: sigstore/gh-action-sigstore-python@v3.4.0
+      with:
+        inputs: >-
+          ./dist/*.tar.gz
+          ./dist/*.whl
+    - name: Upload artifact signatures to GitHub Release
+      # This action also updates an existing release (created above) rather
+      # than only creating one, which is what we want here.
+      uses: softprops/action-gh-release@v3
+      with:
+        files: dist/**
