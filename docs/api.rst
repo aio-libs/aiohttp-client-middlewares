@@ -75,3 +75,38 @@ Digest authentication
            # The middleware automatically handles the digest auth handshake.
            async with session.get("http://protected.example.com") as resp:
                assert resp.status == 200
+
+
+Rate limiting
+-------------
+
+.. class:: RateLimitMiddleware(rate=10.0, burst=10, per_domain=False, respect_retry_after=True)
+
+   Client middleware that throttles outgoing requests with a token bucket.
+
+   :param float rate: Sustained request rate, in requests per second.
+   :param int burst: Number of requests allowed to go out back-to-back before
+      throttling kicks in.
+   :param bool per_domain: Keep an independent bucket per target host instead
+      of a single global bucket.
+   :param bool respect_retry_after: Sleep for the duration of a numeric
+      ``Retry-After`` header on an HTTP 429 response before returning it to the
+      caller.
+
+   The middleware delays each request until the bucket grants it a slot, so the
+   client never sends faster than ``rate`` requests per second while still
+   allowing short bursts of up to ``burst`` requests. Slots are served in strict
+   FIFO order.
+
+   **Usage**
+
+   ::
+
+       from aiohttp import ClientSession
+       from aiohttp_client_middlewares import RateLimitMiddleware
+
+       # At most 5 requests/second, bursting up to 2.
+       rate_limit = RateLimitMiddleware(rate=5.0, burst=2)
+       async with ClientSession(middlewares=(rate_limit,)) as session:
+           async with session.get("http://example.com") as resp:
+               assert resp.status == 200

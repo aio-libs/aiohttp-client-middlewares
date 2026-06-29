@@ -1,0 +1,3 @@
+Added :class:`~aiohttp_client_middlewares.RateLimitMiddleware`, a client-side
+token-bucket rate limiter with optional per-domain buckets and ``Retry-After``
+handling -- by :user:`rodrigobnogueira`.
