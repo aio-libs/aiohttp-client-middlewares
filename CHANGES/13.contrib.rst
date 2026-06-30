@@ -1,0 +1,3 @@
+Added a workflow that enables auto-merge on Dependabot pull requests, so
+routine dependency bumps merge themselves once CI passes
+-- by :user:`rodrigobnogueira`.
