@@ -113,3 +113,62 @@ async def test_rate_limit_middleware_respects_retry_after(
 
     assert resp.status == 429
     assert 0.08 <= elapsed < 0.5
+
+
+async def test_retry_after_missing_header(aiohttp_client: AiohttpClient) -> None:
+    """A 429 without a ``Retry-After`` header is returned without sleeping."""
+
+    async def handler(request: web.Request) -> web.Response:
+        return web.Response(status=429)
+
+    app = web.Application()
+    app.router.add_get("/api", handler)
+    middleware = RateLimitMiddleware(rate=100.0, burst=10, respect_retry_after=True)
+    client = await aiohttp_client(app, middlewares=(middleware,))
+
+    start = time.monotonic()
+    resp = await client.get("/api")
+    elapsed = time.monotonic() - start
+
+    assert resp.status == 429
+    assert elapsed < 0.1  # nothing to wait on
+
+
+async def test_retry_after_non_numeric(aiohttp_client: AiohttpClient) -> None:
+    """A non-numeric ``Retry-After`` (HTTP-date) is ignored without sleeping."""
+
+    async def handler(request: web.Request) -> web.Response:
+        return web.Response(
+            status=429, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}
+        )
+
+    app = web.Application()
+    app.router.add_get("/api", handler)
+    middleware = RateLimitMiddleware(rate=100.0, burst=10, respect_retry_after=True)
+    client = await aiohttp_client(app, middlewares=(middleware,))
+
+    start = time.monotonic()
+    resp = await client.get("/api")
+    elapsed = time.monotonic() - start
+
+    assert resp.status == 429
+    assert elapsed < 0.1  # an HTTP-date is not parsed as seconds
+
+
+async def test_retry_after_disabled(aiohttp_client: AiohttpClient) -> None:
+    """With ``respect_retry_after=False`` a 429 + ``Retry-After`` is not honored."""
+
+    async def handler(request: web.Request) -> web.Response:
+        return web.Response(status=429, headers={"Retry-After": "5"})
+
+    app = web.Application()
+    app.router.add_get("/api", handler)
+    middleware = RateLimitMiddleware(rate=100.0, burst=10, respect_retry_after=False)
+    client = await aiohttp_client(app, middlewares=(middleware,))
+
+    start = time.monotonic()
+    resp = await client.get("/api")
+    elapsed = time.monotonic() - start
+
+    assert resp.status == 429
+    assert elapsed < 0.1  # respect_retry_after=False, so Retry-After: 5 is ignored
