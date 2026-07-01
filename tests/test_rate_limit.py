@@ -41,6 +41,13 @@ def _retry_after_app(value: str) -> web.Application:
     return app
 
 
+async def _cancel_and_join(task: "asyncio.Future[None]") -> None:
+    """Cancel a pending acquire and wait for it to finish unwinding."""
+    task.cancel()
+    await asyncio.wait({task})
+    assert task.cancelled()
+
+
 async def test_token_bucket_allows_burst() -> None:
     """Tokens up to burst size should be available immediately."""
     bucket = TokenBucket(rate=10.0, burst=3)
@@ -319,9 +326,7 @@ async def test_cancelled_acquire_reclaims_slot_for_next_waiter() -> None:
     await asyncio.sleep(0)  # let the ghost queue and the scheduler start
     real = asyncio.ensure_future(bucket.acquire())
     await asyncio.sleep(0)  # let the real waiter queue behind the ghost
-    ghost.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await ghost
+    await _cancel_and_join(ghost)
 
     await asyncio.wait_for(real, timeout=1.0)
     elapsed = time.monotonic() - start
@@ -337,9 +342,7 @@ async def test_cancel_sole_waiter_recovers() -> None:
 
     sole = asyncio.ensure_future(bucket.acquire())
     await asyncio.sleep(0.02)  # let the scheduler start sleeping for it
-    sole.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await sole
+    await _cancel_and_join(sole)
 
     # Let the scheduler wake into the now-empty queue (slot-reclaim path), then
     # a fresh acquire must still be served without hanging.
@@ -362,9 +365,7 @@ def test_bucket_survives_event_loop_teardown_mid_throttle() -> None:
         # returning here makes asyncio.run cancel the pending scheduler task.
         pending = asyncio.ensure_future(bucket.acquire())
         await asyncio.sleep(0.02)
-        pending.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await pending
+        await _cancel_and_join(pending)
 
     async def second_loop() -> None:
         # Would hang forever if the scheduler reference were stranded True.
