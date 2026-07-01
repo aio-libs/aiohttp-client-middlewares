@@ -118,10 +118,13 @@ class RateLimitMiddleware:
         numeric ``Retry-After`` header on an HTTP 429 response before returning
         it to the caller.
     :param max_retry_after: Upper bound, in seconds, on how long a
-        ``Retry-After`` header may make the client sleep. ``None`` removes the
-        cap. Non-finite (``inf``/``nan``) and non-positive values are always
+        ``Retry-After`` header may make the client sleep. Must be ``None`` (no
+        cap) or a non-negative, finite number. A server-sent ``Retry-After``
+        that is itself non-finite (``inf``/``nan``) or non-positive is always
         ignored, so a hostile server cannot stall the client indefinitely.
     :type max_retry_after: float or None
+    :raises ValueError: if ``rate``, ``burst`` or ``max_retry_after`` is out of
+        range.
     """
 
     rate: float
@@ -148,6 +151,13 @@ class RateLimitMiddleware:
         self._domain_buckets: dict[str, TokenBucket] = defaultdict(
             lambda: TokenBucket(rate, burst)
         )
+        if max_retry_after is not None and (
+            not math.isfinite(max_retry_after) or max_retry_after < 0
+        ):
+            raise ValueError(
+                "max_retry_after must be None or a non-negative finite "
+                f"number, got {max_retry_after!r}"
+            )
 
     def _get_bucket(self, request: ClientRequest) -> TokenBucket:
         if self.per_domain:

@@ -95,9 +95,10 @@ Rate limiting
       ``Retry-After`` header on an HTTP 429 response before returning it to the
       caller.
    :param max_retry_after: Upper bound, in seconds, on how long a ``Retry-After``
-      header may make the client sleep. ``None`` removes the cap. Non-finite
-      (``inf``/``nan``) and non-positive values are always ignored, so a hostile
-      server cannot stall the client indefinitely.
+      header may make the client sleep. Must be ``None`` (no cap) or a
+      non-negative, finite number. A server-sent ``Retry-After`` that is itself
+      non-finite (``inf``/``nan``) or non-positive is always ignored, so a
+      hostile server cannot stall the client indefinitely.
    :type max_retry_after: float or None
 
    The middleware delays each request until the bucket grants it a slot, so the
@@ -105,8 +106,8 @@ Rate limiting
    allowing short bursts of up to ``burst`` requests. Slots are served in strict
    FIFO order.
 
-   ``rate`` and ``burst`` are validated on construction and raise
-   :exc:`ValueError` if out of range.
+   ``rate``, ``burst`` and ``max_retry_after`` are validated on construction and
+   raise :exc:`ValueError` if out of range.
 
    **Usage**
 

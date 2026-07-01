@@ -224,6 +224,20 @@ def test_invalid_burst_raises(burst: int) -> None:
         RateLimitMiddleware(burst=burst)
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), -1.0])
+def test_invalid_max_retry_after_raises(value: float) -> None:
+    """A non-finite or negative max_retry_after is rejected at construction."""
+    with pytest.raises(ValueError, match="max_retry_after"):
+        RateLimitMiddleware(max_retry_after=value)
+
+
+@pytest.mark.parametrize("value", [None, 0.0, 0.5, 300.0])
+def test_valid_max_retry_after_accepted(value: "float | None") -> None:
+    """None and any non-negative finite max_retry_after are accepted."""
+    middleware = RateLimitMiddleware(max_retry_after=value)
+    assert middleware.max_retry_after == value
+
+
 # --- Retry-After edge cases -------------------------------------------------
 
 
