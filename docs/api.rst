@@ -80,23 +80,33 @@ Digest authentication
 Rate limiting
 -------------
 
-.. class:: RateLimitMiddleware(rate=10.0, burst=10, per_domain=False, respect_retry_after=True)
+.. class:: RateLimitMiddleware(rate=10.0, burst=10, per_domain=False, respect_retry_after=True, max_retry_after=300.0)
 
    Client middleware that throttles outgoing requests with a token bucket.
 
-   :param float rate: Sustained request rate, in requests per second.
+   :param float rate: Sustained request rate, in requests per second. Must be
+      greater than 0.
    :param int burst: Number of requests allowed to go out back-to-back before
-      throttling kicks in.
+      throttling kicks in. Must be at least 1.
    :param bool per_domain: Keep an independent bucket per target host instead
-      of a single global bucket.
+      of a single global bucket. The per-host buckets are never evicted, so only
+      enable this for a bounded, trusted set of hosts.
    :param bool respect_retry_after: Sleep for the duration of a numeric
       ``Retry-After`` header on an HTTP 429 response before returning it to the
       caller.
+   :param max_retry_after: Upper bound, in seconds, on how long a ``Retry-After``
+      header may make the client sleep. ``None`` removes the cap. Non-finite
+      (``inf``/``nan``) and non-positive values are always ignored, so a hostile
+      server cannot stall the client indefinitely.
+   :type max_retry_after: float or None
 
    The middleware delays each request until the bucket grants it a slot, so the
    client never sends faster than ``rate`` requests per second while still
    allowing short bursts of up to ``burst`` requests. Slots are served in strict
    FIFO order.
+
+   ``rate`` and ``burst`` are validated on construction and raise
+   :exc:`ValueError` if out of range.
 
    **Usage**
 

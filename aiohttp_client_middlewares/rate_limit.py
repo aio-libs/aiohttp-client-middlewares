@@ -7,11 +7,13 @@ requests so it does not overwhelm upstream servers or exceed API quotas.
 Features:
 - Configurable rate and burst size
 - Optional per-domain buckets
-- Automatic ``Retry-After`` header handling
+- Automatic ``Retry-After`` header handling (bounded, and safe against
+  non-finite/hostile values)
 """
 
 import asyncio
 import logging
+import math
 import time
 from collections import defaultdict, deque
 from http import HTTPStatus
@@ -28,19 +30,27 @@ class TokenBucket:
     ``_schedule`` coroutine services the queue front-to-back, sleeping until
     each slot's send time arrives and then unblocking the corresponding
     caller. This guarantees strict FIFO ordering even under high concurrency.
+
+    The scheduler binds to whichever event loop is running when it first
+    starts, but the bucket heals across loops: if the scheduler is cancelled
+    (for example, the loop is torn down while a request is throttled), the
+    next ``acquire`` -- possibly on a new loop -- restarts it.
     """
 
     def __init__(self, rate: float, burst: int) -> None:
+        if rate <= 0:
+            raise ValueError(f"rate must be > 0, got {rate!r}")
+        if burst < 1:
+            raise ValueError(f"burst must be >= 1, got {burst!r}")
         self._interval = 1.0 / rate
         self._burst = burst
         # Start *burst* intervals in the past so the first ``burst`` acquires
         # are instant.
         self._next_send = time.monotonic() - burst * self._interval
         self._waiters: deque[asyncio.Event] = deque()
-        self._scheduling = False
-        # Keep a strong reference to the scheduler task: the event loop only
-        # holds a weak reference to it, so an otherwise-unreferenced task can
-        # be garbage collected mid-run.
+        # Strong reference to the running scheduler task (the loop only keeps a
+        # weak one, so an otherwise-unreferenced task could be garbage collected
+        # mid-run). ``None`` also means "no scheduler is running".
         self._scheduler_task: asyncio.Task[None] | None = None
 
     async def acquire(self) -> None:
@@ -48,27 +58,46 @@ class TokenBucket:
         event = asyncio.Event()
         self._waiters.append(event)
         self._ensure_scheduling()
-        await event.wait()
+        try:
+            await event.wait()
+        except asyncio.CancelledError:
+            # Drop our slot so the scheduler does not waste an interval on a
+            # waiter that will never be served.
+            try:
+                self._waiters.remove(event)
+            except ValueError:  # pragma: no cover - scheduler already served it
+                pass
+            raise
 
     def _ensure_scheduling(self) -> None:
-        """Start the scheduler loop if it is not already running."""
-        if not self._scheduling:
-            self._scheduling = True
+        """Start the scheduler loop if one is not already running."""
+        if self._scheduler_task is None:
             self._scheduler_task = asyncio.ensure_future(self._schedule())
 
     async def _schedule(self) -> None:
         """Service waiters in FIFO order, one slot at a time."""
-        while self._waiters:
-            now = time.monotonic()
-            # Cap drift so idle periods never accumulate more than *burst*
-            # free slots.
-            self._next_send = max(self._next_send, now - self._burst * self._interval)
-            self._next_send += self._interval
-            delay = self._next_send - now
-            if delay > 0:
-                await asyncio.sleep(delay)
-            self._waiters.popleft().set()
-        self._scheduling = False
+        try:
+            while self._waiters:
+                now = time.monotonic()
+                # Cap drift so idle periods never accumulate more than *burst*
+                # free slots.
+                self._next_send = max(
+                    self._next_send, now - self._burst * self._interval
+                )
+                self._next_send += self._interval
+                delay = self._next_send - now
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                if self._waiters:
+                    self._waiters.popleft().set()
+                else:
+                    # The waiter was cancelled while we slept; hand the slot
+                    # back rather than losing it to the drift cap.
+                    self._next_send -= self._interval
+        finally:
+            # Always clear the reference -- even on cancellation -- so a later
+            # ``acquire`` restarts the scheduler (including on a new loop).
+            self._scheduler_task = None
 
 
 class RateLimitMiddleware:
@@ -78,20 +107,28 @@ class RateLimitMiddleware:
     slot, so the client never sends faster than ``rate`` requests per second
     (allowing short bursts of up to ``burst`` requests).
 
-    :param float rate: Sustained request rate, in requests per second.
+    :param float rate: Sustained request rate, in requests per second. Must be
+        greater than 0.
     :param int burst: Number of requests allowed to go out back-to-back before
-        throttling kicks in.
-    :param bool per_domain: When ``True``, keep an independent bucket per
-        target host instead of a single global bucket.
+        throttling kicks in. Must be at least 1.
+    :param bool per_domain: When ``True``, keep an independent bucket per target
+        host instead of a single global bucket. The per-host buckets are never
+        evicted, so only enable this for a bounded, trusted set of hosts.
     :param bool respect_retry_after: When ``True``, sleep for the duration of a
         numeric ``Retry-After`` header on an HTTP 429 response before returning
         it to the caller.
+    :param max_retry_after: Upper bound, in seconds, on how long a
+        ``Retry-After`` header may make the client sleep. ``None`` removes the
+        cap. Non-finite (``inf``/``nan``) and non-positive values are always
+        ignored, so a hostile server cannot stall the client indefinitely.
+    :type max_retry_after: float or None
     """
 
     rate: float
     burst: int
     per_domain: bool
     respect_retry_after: bool
+    max_retry_after: float | None
 
     def __init__(
         self,
@@ -99,11 +136,14 @@ class RateLimitMiddleware:
         burst: int = 10,
         per_domain: bool = False,
         respect_retry_after: bool = True,
+        max_retry_after: float | None = 300.0,
     ) -> None:
         self.rate = rate
         self.burst = burst
         self.per_domain = per_domain
         self.respect_retry_after = respect_retry_after
+        self.max_retry_after = max_retry_after
+        # Building the bucket validates rate/burst eagerly (fail fast).
         self._global_bucket = TokenBucket(rate, burst)
         self._domain_buckets: dict[str, TokenBucket] = defaultdict(
             lambda: TokenBucket(rate, burst)
@@ -119,15 +159,27 @@ class RateLimitMiddleware:
         if response.status != HTTPStatus.TOO_MANY_REQUESTS:
             return
         retry_after = response.headers.get("Retry-After")
-        if retry_after:
-            try:
-                wait_seconds = float(retry_after)
-                _LOGGER.info("Server requested Retry-After: %ss", wait_seconds)
-                await asyncio.sleep(wait_seconds)
-            except ValueError:
-                _LOGGER.debug(
-                    "Retry-After is not a number (likely HTTP-date): %s", retry_after
-                )
+        if not retry_after:
+            return
+        try:
+            wait_seconds = float(retry_after)
+        except ValueError:
+            _LOGGER.debug(
+                "Retry-After is not a number (likely HTTP-date): %s", retry_after
+            )
+            return
+        # ``float()`` also accepts "inf"/"nan"; never sleep on those (or on a
+        # non-positive value) -- an untrusted server could otherwise stall or
+        # hang the client.
+        if not math.isfinite(wait_seconds) or wait_seconds <= 0:
+            _LOGGER.debug(
+                "Ignoring non-finite or non-positive Retry-After: %s", retry_after
+            )
+            return
+        if self.max_retry_after is not None:
+            wait_seconds = min(wait_seconds, self.max_retry_after)
+        _LOGGER.info("Server requested Retry-After: %ss", wait_seconds)
+        await asyncio.sleep(wait_seconds)
 
     async def __call__(
         self,
