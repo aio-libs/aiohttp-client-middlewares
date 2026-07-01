@@ -1,0 +1,3 @@
+Fixed :class:`~aiohttp_client_middlewares.DigestAuthMiddleware` corrupting the
+``Digest`` challenge when a ``WWW-Authenticate`` response offered more than one
+authentication scheme -- by :user:`Dreamsorcerer`.
