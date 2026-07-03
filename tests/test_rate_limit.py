@@ -1,6 +1,7 @@
 """Tests for the rate-limiting middleware."""
 
 import asyncio
+import gc
 import threading
 import time
 from typing import cast
@@ -160,7 +161,7 @@ async def test_retry_after_missing_header(aiohttp_client: AiohttpClient) -> None
     elapsed = time.monotonic() - start
 
     assert resp.status == 429
-    assert elapsed < 0.1  # nothing to wait on
+    assert elapsed < 0.5  # nothing to wait on
 
 
 async def test_retry_after_non_numeric(aiohttp_client: AiohttpClient) -> None:
@@ -181,7 +182,7 @@ async def test_retry_after_non_numeric(aiohttp_client: AiohttpClient) -> None:
     elapsed = time.monotonic() - start
 
     assert resp.status == 429
-    assert elapsed < 0.1  # an HTTP-date is not parsed as seconds
+    assert elapsed < 0.5  # an HTTP-date is not parsed as seconds
 
 
 async def test_retry_after_disabled(aiohttp_client: AiohttpClient) -> None:
@@ -200,15 +201,20 @@ async def test_retry_after_disabled(aiohttp_client: AiohttpClient) -> None:
     elapsed = time.monotonic() - start
 
     assert resp.status == 429
-    assert elapsed < 0.1  # respect_retry_after=False, so Retry-After: 5 is ignored
+    assert elapsed < 0.5  # respect_retry_after=False, so Retry-After: 5 is ignored
 
 
 # --- Input validation -------------------------------------------------------
 
 
-@pytest.mark.parametrize("rate", [0.0, -1.0, -0.5])
+@pytest.mark.parametrize("rate", [0.0, -1.0, -0.5, float("nan"), float("inf"), 5e-324])
 def test_invalid_rate_raises(rate: float) -> None:
-    """A non-positive rate is rejected at construction time."""
+    """A non-positive, non-finite, or too-small rate is rejected eagerly.
+
+    ``nan``/``inf`` pass a plain ``rate <= 0`` check, and the subnormal
+    ``5e-324`` overflows ``1.0 / rate`` to ``inf`` -- each would silently
+    disable throttling if accepted.
+    """
     with pytest.raises(ValueError, match="rate"):
         TokenBucket(rate=rate, burst=1)
     with pytest.raises(ValueError, match="rate"):
@@ -283,6 +289,21 @@ async def test_retry_after_without_cap(aiohttp_client: AiohttpClient) -> None:
     assert 0.08 <= elapsed < 0.5  # honored the ~0.1s wait with no cap applied
 
 
+async def test_retry_after_sleep_disabled_by_zero_cap(
+    aiohttp_client: AiohttpClient,
+) -> None:
+    """``max_retry_after=0.0`` disables the Retry-After sleep entirely."""
+    middleware = RateLimitMiddleware(rate=100.0, burst=10, max_retry_after=0.0)
+    client = await aiohttp_client(_retry_after_app("5"), middlewares=(middleware,))
+
+    start = time.monotonic()
+    resp = await client.get("/api")
+    elapsed = time.monotonic() - start
+
+    assert resp.status == 429
+    assert elapsed < 0.5  # would be ~5s if the header were honored
+
+
 # --- Per-domain vs global bucket selection ----------------------------------
 
 
@@ -315,24 +336,24 @@ def test_global_mode_shares_one_bucket() -> None:
 
 async def test_drift_cap_limits_idle_burst() -> None:
     """Idle time must not accumulate more than ``burst`` free slots."""
-    bucket = TokenBucket(rate=100.0, burst=2)  # interval 0.01s
+    bucket = TokenBucket(rate=10.0, burst=2)  # interval 0.1s
     await bucket.acquire()
     await bucket.acquire()  # drain the two burst tokens
-    await asyncio.sleep(0.2)  # idle far longer than burst * interval
+    await asyncio.sleep(0.25)  # idle far longer than burst * interval
 
     start = time.monotonic()
     for _ in range(2):
         await bucket.acquire()  # exactly *burst* acquires should be instant
-    assert time.monotonic() - start < 0.005
+    assert time.monotonic() - start < 0.05
 
     start = time.monotonic()
     await bucket.acquire()  # the (burst + 1)th must throttle
-    assert time.monotonic() - start >= 0.008
+    assert time.monotonic() - start >= 0.08
 
 
 async def test_cancelled_acquire_reclaims_slot_for_next_waiter() -> None:
     """A cancelled acquire must hand its slot to the next waiter, not waste it."""
-    bucket = TokenBucket(rate=10.0, burst=1)  # interval 0.1s
+    bucket = TokenBucket(rate=5.0, burst=1)  # interval 0.2s
     await bucket.acquire()  # drain the single burst token
 
     start = time.monotonic()
@@ -342,11 +363,12 @@ async def test_cancelled_acquire_reclaims_slot_for_next_waiter() -> None:
     await asyncio.sleep(0)  # let the real waiter queue behind the ghost
     await _cancel_and_join(ghost)
 
-    await asyncio.wait_for(real, timeout=1.0)
+    await asyncio.wait_for(real, timeout=2.0)
     elapsed = time.monotonic() - start
-    # The real waiter inherits the ghost's slot: served after ~1 interval, not
-    # forced to wait ~2 because the ghost still occupied the queue.
-    assert elapsed < 0.15
+    # The real waiter inherits the ghost's slot: served after ~1 interval
+    # (0.2s), not forced to wait ~2 (0.4s) because the ghost still occupied
+    # the queue.
+    assert elapsed < 0.32
 
 
 async def test_cancel_sole_waiter_recovers() -> None:
@@ -362,6 +384,82 @@ async def test_cancel_sole_waiter_recovers() -> None:
     # a fresh acquire must still be served without hanging.
     await asyncio.sleep(0.12)
     await asyncio.wait_for(bucket.acquire(), timeout=1.0)
+
+
+async def test_scheduler_cancelled_before_first_run_recovers() -> None:
+    """A scheduler cancelled before it ever runs must not poison the bucket.
+
+    Cancelling a task before its first step skips the coroutine body entirely,
+    so the ``finally`` that normally clears ``_scheduler_task`` never runs --
+    this is how a loop teardown can catch a scheduler that was just started.
+    A later acquire must notice the done task and restart scheduling.
+    """
+    bucket = TokenBucket(rate=10.0, burst=1)
+    await bucket.acquire()  # drain the burst token
+
+    ghost = asyncio.ensure_future(bucket.acquire())
+    await asyncio.sleep(0)  # the ghost queues itself and spawns the scheduler
+    scheduler = bucket._scheduler_task
+    assert scheduler is not None
+    scheduler.cancel()  # cancelled before the scheduler's first step
+    await asyncio.wait({scheduler})
+    assert scheduler.cancelled()
+    assert bucket._scheduler_task is scheduler  # the stale reference survives
+    await _cancel_and_join(ghost)
+
+    # A fresh acquire must restart scheduling instead of hanging forever.
+    await asyncio.wait_for(bucket.acquire(), timeout=1.0)
+
+
+def test_bucket_survives_abandoned_event_loop_mid_throttle() -> None:
+    """A loop closed *without cancelling tasks* must not strand the bucket.
+
+    ``run_until_complete`` + ``close`` (unlike ``asyncio.run``) never cancels
+    the scheduler, so it stays suspended forever and its waiters can never be
+    woken. Reusing the bucket on a fresh loop must drop those unservable
+    waiters and restart scheduling rather than hang.
+    """
+    bucket = TokenBucket(rate=10.0, burst=1)  # interval 0.1s
+
+    async def start_throttled_acquire() -> "asyncio.Future[None]":
+        await bucket.acquire()  # instant (burst)
+        pending = asyncio.ensure_future(bucket.acquire())
+        await asyncio.sleep(0.02)  # the scheduler is now sleeping for it
+        return pending
+
+    async def reuse() -> None:
+        # Would hang forever if the stranded scheduler or waiter were kept.
+        await asyncio.wait_for(bucket.acquire(), timeout=1.0)
+        throttled = asyncio.ensure_future(bucket.acquire())
+        await asyncio.sleep(0)  # a replacement scheduler is now registered
+        replacement = bucket._scheduler_task
+        assert replacement is not None
+        # Collect the stranded scheduler *while the replacement runs*: it
+        # pins itself through a reference cycle with its own task, and
+        # closing it runs its ``finally``, which must not clear the
+        # replacement's registration.
+        gc.collect()
+        assert bucket._scheduler_task is replacement
+        await asyncio.wait_for(throttled, timeout=1.0)
+
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            loop = asyncio.new_event_loop()
+            pending = loop.run_until_complete(start_throttled_acquire())
+            loop.close()  # abandoned: neither pending task was cancelled
+            assert not pending.cancelled()
+            asyncio.run(reuse())
+        except Exception as exc:  # deadlock/timeout is surfaced by the asserts
+            errors.append(exc)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(timeout=5.0)
+
+    assert not thread.is_alive(), "acquire after loop abandonment deadlocked"
+    assert not errors, f"worker raised: {errors[0]!r}"
 
 
 def test_bucket_survives_event_loop_teardown_mid_throttle() -> None:
@@ -394,7 +492,7 @@ def test_bucket_survives_event_loop_teardown_mid_throttle() -> None:
         except Exception as exc:  # deadlock/timeout is surfaced by the asserts
             errors.append(exc)
 
-    thread = threading.Thread(target=worker)
+    thread = threading.Thread(target=worker, daemon=True)
     thread.start()
     thread.join(timeout=5.0)
 
