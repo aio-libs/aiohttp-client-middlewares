@@ -2,13 +2,19 @@
 
 Two cooperating layers:
 
-- :class:`SSRFConnector` -- the primary control. It validates every address a
-  request would actually connect to (DNS answers and IP-literals alike, on
-  every redirect hop) and refuses connections to non-public addresses.
-- :class:`SSRFMiddleware` -- optional defense in depth. It enforces URL-scheme
-  and hostname allow/deny rules before any connection is attempted and fails
-  with clearer errors, but on its own it cannot stop a hostname that
-  *resolves* to an internal address. Never use it as the sole control.
+- :class:`SSRFConnector` -- the primary control for *direct* connections. It
+  validates every address a request would actually connect to (DNS answers and
+  IP-literals alike, on every redirect hop) and refuses non-public addresses.
+  When a forward proxy is configured (``proxy=``, or ``trust_env=True`` with
+  ``HTTP_PROXY``/``HTTPS_PROXY``) the connector resolves and validates only the
+  *proxy* endpoint -- the proxy resolves the target, which the connector never
+  sees.
+- :class:`SSRFMiddleware` -- the URL-level layer. It enforces URL-scheme and
+  hostname allow/deny rules before any connection is attempted. It is required
+  for scheme policing and is the only layer that can constrain the target when
+  a proxy is configured (it sees ``request.url``); on its own it cannot stop a
+  hostname that *resolves* to an internal address. Never use it as the sole
+  control.
 
 This replaces the simplified ``ssrf_middleware``/``SSRFConnector`` example
 from aiohttp's client middleware cookbook (which only blocks ``127.0.0.1`` and
@@ -52,6 +58,9 @@ _EXTRA_BLOCKED_NETWORKS: tuple[_IPNetwork, ...] = (
     ip_network("64:ff9b:1::/48"),  # NAT64 local-use prefixes (RFC 8215)
     ip_network("2002::/16"),  # 6to4: embeds an arbitrary IPv4 address
     ip_network("2001::/32"),  # Teredo: embeds an arbitrary IPv4 address
+    # IPv6 documentation range (RFC 9637); is_global is only False on
+    # CPython 3.12.7+/3.13+, so block it explicitly on every supported version.
+    ip_network("3fff::/20"),
 )
 
 
@@ -99,8 +108,19 @@ def is_unsafe_address(address: "str | _IPAddress") -> bool:
 
 
 def _normalize_host(host: str) -> str:
-    """Normalize a hostname for exact matching (case, trailing dot)."""
-    return host.lower().removesuffix(".")
+    """Normalize a hostname for exact matching (case, trailing dot, IDNA).
+
+    Encoding to IDNA/punycode lets a single rule entry match in both layers:
+    the connector sees the punycode ``raw_host`` while the middleware sees the
+    Unicode ``host``, and both normalize to the same ASCII form. Non-encodable
+    input (IP literals, oversized labels, empty host) is left as-is; the
+    connector still enforces the resolved-address check regardless.
+    """
+    host = host.lower().removesuffix(".")
+    try:
+        return host.encode("idna").decode("ascii")
+    except (UnicodeError, ValueError):
+        return host
 
 
 def _parse_host_rules(
@@ -138,17 +158,28 @@ def _matches_rules(
 class SSRFMiddleware:
     """Client middleware enforcing scheme and hostname rules against SSRF.
 
-    This is the defense-in-depth half of the protection: it rejects requests
-    before a connection is attempted, based on what is visible in the URL. It
-    cannot see what a hostname resolves to, so it must be paired with
-    :class:`SSRFConnector` (or an equivalent resolved-address control) to
-    actually stop attacker-controlled DNS. The middleware runs for every
-    redirect hop, so the rules apply to redirect targets as well.
+    This is the URL-level layer of the protection: it rejects requests before a
+    connection is attempted, based on what is visible in the URL. It cannot see
+    what a hostname resolves to, so it must be paired with :class:`SSRFConnector`
+    (or an equivalent resolved-address control) to stop attacker-controlled DNS.
+    It is nonetheless required, not merely defense in depth: it is the only
+    layer that polices the URL scheme, and the only one that can constrain the
+    target when a forward proxy is configured (the connector then sees only the
+    proxy). The middleware runs for every redirect hop.
+
+    The literal-IP fast path recognizes only canonical addresses. Non-canonical
+    numeric forms (``0x7f000001``, ``2130706433``, ``127.1``, ``0177.0.0.1``)
+    are treated as hostnames here and stopped only by :class:`SSRFConnector`
+    (aiohttp rejects the decimal/octal/short IPv4 forms as non-canonical; the
+    hex form is caught after resolution) -- another reason not to rely on the
+    middleware alone.
 
     :param allowlist: When given, only requests whose URL host matches one of
         these entries are allowed; everything else raises :exc:`SSRFError`.
-        Entries are exact hostnames (case-insensitive, trailing dot ignored)
-        or IP addresses/CIDR networks matched against literal-IP URL hosts.
+        ``None`` disables the allowlist; an empty list blocks every request
+        (fail closed). Entries are exact hostnames (case-insensitive, trailing
+        dot ignored, IDNA-normalized) or IP addresses/CIDR networks matched
+        against literal-IP URL hosts.
     :type allowlist: iterable of str or None
     :param denylist: Requests whose URL host matches one of these entries
         raise :exc:`SSRFError`. Same entry forms as ``allowlist``. Checked
@@ -202,14 +233,23 @@ class SSRFMiddleware:
 class SSRFConnector(TCPConnector):
     """A ``TCPConnector`` that refuses to connect to non-public addresses.
 
-    This is the primary SSRF control: it validates the addresses a request
-    would actually use -- IP-literals and DNS answers alike, on the initial
-    request and on every redirect hop -- at the single point every connection
-    passes through, closing the gap where an attacker-controlled hostname
-    resolves to an internal address.
+    This is the primary SSRF control for direct connections: it validates the
+    addresses a request would actually use -- IP-literals and DNS answers
+    alike, on the initial request and on every redirect hop -- closing the gap
+    where an attacker-controlled hostname resolves to an internal address.
 
-    :param allowlist: Entries exempted from blocking. An exact hostname
-        (case-insensitive, trailing dot ignored) exempts everything that host
+    .. note::
+       When a forward proxy is configured (``proxy=`` on the request, or
+       ``trust_env=True`` with ``HTTP_PROXY``/``HTTPS_PROXY`` set), the
+       connector resolves and validates only the *proxy* endpoint; the target
+       is resolved by the proxy and is not seen here. Pair with
+       :class:`SSRFMiddleware` to constrain proxied targets.
+
+    :param allowlist: Entries exempted from blocking, layered on top of the
+        default public-only policy -- an empty list means "no extra exemptions"
+        and public traffic still passes (the opposite sense to the middleware's
+        restrictive ``allowlist``). An exact hostname (case-insensitive,
+        trailing dot ignored, IDNA-normalized) exempts everything that host
         resolves to; an IP address or CIDR network exempts resolved addresses
         inside it. Use this to reach known-internal services deliberately.
     :type allowlist: iterable of str or None

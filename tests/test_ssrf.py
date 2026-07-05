@@ -15,6 +15,7 @@ from aiohttp_client_middlewares.ssrf import (
     SSRFConnector,
     SSRFError,
     SSRFMiddleware,
+    _normalize_host,
     is_unsafe_address,
 )
 
@@ -94,6 +95,8 @@ def _fake_results(*ips: str) -> "list[ResolveResult]":
         "64:ff9b:1::1",  # NAT64 local-use
         "2002:808:808::1",  # 6to4: embeds an arbitrary IPv4 address
         "2001::1",  # Teredo: embeds an arbitrary IPv4 address
+        "3fff::1",  # RFC 9637 documentation range (is_global varies by version)
+        "3fff:0fff:ffff:ffff:ffff:ffff:ffff:ffff",  # RFC 9637 range, upper end
         "::ffff:10.0.0.1",  # IPv4-mapped private
         "::ffff:169.254.169.254",  # IPv4-mapped metadata endpoint
         "not-an-ip-address",  # unparsable input fails closed
@@ -118,6 +121,21 @@ def test_unsafe_addresses_blocked(address: str) -> None:
 def test_public_addresses_allowed(address: str) -> None:
     """Globally-routable public addresses are not flagged."""
     assert not is_unsafe_address(address)
+
+
+@pytest.mark.parametrize(
+    "host,expected",
+    [
+        ("EXAMPLE.com.", "example.com"),  # lowercased, trailing dot stripped
+        ("☃.internal", "xn--n3h.internal"),  # Unicode -> punycode
+        ("xn--n3h.internal", "xn--n3h.internal"),  # already punycode (idempotent)
+        ("127.0.0.1", "127.0.0.1"),  # IP literal untouched
+        ("a" * 70 + ".example", "a" * 70 + ".example"),  # un-encodable -> fallback
+    ],
+)
+def test_normalize_host(host: str, expected: str) -> None:
+    """Hosts fold to a single IDNA/case/dot form; bad input falls back as-is."""
+    assert _normalize_host(host) == expected
 
 
 def test_classifier_accepts_address_objects() -> None:
@@ -238,6 +256,33 @@ async def test_middleware_allowlist_cidr_overrides_unsafe_check() -> None:
     assert response is not None
     with pytest.raises(SSRFError, match="not on the allowlist"):
         await middleware(_fake_request("http://8.8.8.8/"), _forbidden_handler)
+
+
+async def test_one_idn_rule_matches_both_layers() -> None:
+    """A single Unicode IDN rule matches in the connector and the middleware.
+
+    The connector receives the punycode ``raw_host`` while the middleware
+    receives the Unicode ``host``; IDNA-normalizing both the rule and the host
+    lets one entry cover both. Without normalization the rule would silently
+    no-op in one layer.
+    """
+    # Middleware sees the Unicode host.
+    middleware = SSRFMiddleware(denylist=["☃.example"])  # ☃.example
+    with pytest.raises(SSRFError, match="denylisted"):
+        await middleware(_fake_request("http://☃.example/"), _forbidden_handler)
+
+    # Connector sees the punycode host aiohttp passes to _resolve_host.
+    connector = SSRFConnector(allowlist=["☃.internal"])  # ☃.internal
+    try:
+        with mock.patch.object(
+            TCPConnector,
+            "_resolve_host",
+            mock.AsyncMock(return_value=_fake_results("10.0.0.5")),
+        ):
+            resolved = await connector._resolve_host("xn--n3h.internal", 80)
+            assert len(resolved) == 1  # allowlisted -> internal address exempt
+    finally:
+        await connector.close()
 
 
 # --- Connector (resolved-address rules) ---------------------------------------
