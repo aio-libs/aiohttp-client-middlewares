@@ -80,10 +80,31 @@ Digest authentication
 Rate limiting
 -------------
 
-.. class:: RateLimitMiddleware(rate=10.0, burst=10, per_domain=False, respect_retry_after=True, max_retry_after=60.0)
+.. class:: TokenBucket(rate=10.0, burst=10)
+
+   Synchronous token bucket: ``acquire()`` takes one token and returns the
+   delay, in seconds, the caller must sleep before sending. Tokens accrue
+   continuously at ``rate`` per second, capped at ``burst``; the count may go
+   negative, which is what queues callers up in arrival order. When a
+   *timeout* argument is given and the delay would exceed it, ``acquire``
+   hands the token back and raises :exc:`asyncio.TimeoutError` instead.
+   ``release()`` returns an unused token, e.g. for a caller cancelled while
+   sleeping out its delay. The bucket holds no tasks or loop state.
+
+   :param float rate: Token accrual rate, in tokens per second. Must be a
+      positive, finite number.
+   :param int burst: Bucket capacity. Must be at least 1.
+   :raises ValueError: if ``rate`` or ``burst`` is out of range.
+
+.. class:: RateLimitMiddleware(bucket=None, rate=10.0, burst=10, per_domain=False, respect_retry_after=True, max_retry_after=60.0)
 
    Client middleware that throttles outgoing requests with a token bucket.
 
+   :param bucket: The :class:`TokenBucket` to throttle with; when ``None``
+      (default) one is built from ``rate`` and ``burst``. Mutually exclusive
+      with ``per_domain``, whose buckets are built from ``rate`` and
+      ``burst``.
+   :type bucket: TokenBucket or None
    :param float rate: Sustained request rate, in requests per second. Must be
       a positive, finite number.
    :param int burst: Number of requests allowed to go out back-to-back before
@@ -110,10 +131,13 @@ Rate limiting
       the 429 response.
    :type max_retry_after: float or None
 
-   The middleware delays each request until the bucket grants it a slot, so the
-   client never sends faster than ``rate`` requests per second while still
-   allowing short bursts of up to ``burst`` requests. Slots are served in strict
-   FIFO order.
+   The middleware asks the bucket for a delay and sleeps it out before
+   sending, so the client never sends faster than ``rate`` requests per second
+   while still allowing short bursts of up to ``burst`` requests. Slots are
+   granted in arrival order. When aiohttp exposes the request's total timeout
+   to the middleware (newer versions do), a wait that would exceed it fails
+   immediately with :exc:`asyncio.TimeoutError` instead of sleeping toward a
+   guaranteed timeout.
 
    Configuration is fixed at construction time: changing the attributes of an
    existing instance does not reconfigure buckets that were already built.

@@ -6,6 +6,7 @@ requests so it does not overwhelm upstream servers or exceed API quotas.
 
 Features:
 - Configurable rate and burst size
+- Injectable bucket (room for alternative algorithms later)
 - Optional per-domain buckets
 - Automatic ``Retry-After`` header handling (bounded, and safe against
   non-finite/hostile values)
@@ -15,7 +16,7 @@ import asyncio
 import logging
 import math
 import time
-from collections import defaultdict, deque
+from collections import defaultdict
 from http import HTTPStatus
 
 from aiohttp import ClientHandlerType, ClientRequest, ClientResponse
@@ -24,22 +25,21 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class TokenBucket:
-    """FIFO token-bucket using an ``asyncio.Event`` queue.
+    """Synchronous token bucket: ``acquire`` returns how long to wait.
 
-    Each caller appends its own event to a FIFO queue and waits. A single
-    ``_schedule`` coroutine services the queue front-to-back, sleeping until
-    each slot's send time arrives and then unblocking the corresponding
-    caller. This guarantees strict FIFO ordering even under high concurrency.
+    Tokens accrue continuously at ``rate`` per second, capped at ``burst``.
+    ``acquire`` takes one token immediately and returns the delay the caller
+    must sleep before sending; the count may go negative, which is what
+    queues callers up (each successive over-limit acquire owes one more
+    interval). Because ``acquire`` is synchronous, callers on one event loop
+    reserve slots atomically in arrival order.
 
-    The scheduler binds to whichever event loop is running when it first
-    starts, but the bucket heals across *sequential* loops: once the previous
-    loop is gone -- its scheduler cancelled, finished, or stranded on a closed
-    loop -- the next ``acquire`` restarts scheduling on the current loop, and
-    waiters left behind by an abandoned loop are dropped (they can never be
-    woken). The bucket is not thread-safe: use it from one loop at a time.
+    The bucket never sleeps and holds no tasks or loop state, so it can be
+    shared across sequential event loops. It is not thread-safe: use it from
+    one loop at a time.
     """
 
-    def __init__(self, rate: float, burst: int) -> None:
+    def __init__(self, rate: float = 10.0, burst: int = 10) -> None:
         if not math.isfinite(rate) or rate <= 0:
             raise ValueError(f"rate must be a positive finite number, got {rate!r}")
         if burst < 1:
@@ -48,83 +48,59 @@ class TokenBucket:
         if not math.isfinite(self._interval):
             raise ValueError(f"rate is too small, got {rate!r}")
         self._burst = burst
-        # Start *burst* intervals in the past so the first ``burst`` acquires
-        # are instant.
-        self._next_send = time.monotonic() - burst * self._interval
-        self._waiters: deque[asyncio.Event] = deque()
-        # Strong reference to the running scheduler task (the loop only keeps a
-        # weak one, so an otherwise-unreferenced task could be garbage collected
-        # mid-run). ``None`` also means "no scheduler is running".
-        self._scheduler_task: asyncio.Task[None] | None = None
+        # Start full so the first ``burst`` acquires are instant.
+        self._tokens = float(burst)
+        self._last_refill = time.monotonic()
 
-    async def acquire(self) -> None:
-        """Reserve the next send slot and wait until it arrives."""
-        event = asyncio.Event()
-        self._waiters.append(event)
-        self._ensure_scheduling()
-        try:
-            await event.wait()
-        except asyncio.CancelledError:
-            # Drop our slot so the scheduler does not waste an interval on a
-            # waiter that will never be served.
-            try:
-                self._waiters.remove(event)
-            except ValueError:  # pragma: no cover - scheduler already served it
-                pass
-            raise
+    def _refill(self) -> None:
+        now = time.monotonic()
+        self._tokens = min(
+            self._tokens + (now - self._last_refill) / self._interval,
+            float(self._burst),
+        )
+        self._last_refill = now
 
-    def _ensure_scheduling(self) -> None:
-        """(Re)start the scheduler unless one is live on the current loop."""
-        task = self._scheduler_task
-        if task is not None and not task.done():
-            if task.get_loop() is asyncio.get_running_loop():
-                return
-            # The scheduler is stranded on another (closed) loop and will
-            # never resume. Every waiter queued before the current caller
-            # belongs to that loop too -- setting their events from here
-            # would raise -- so drop them; only the caller that just appended
-            # itself is servable.
-            while len(self._waiters) > 1:
-                self._waiters.popleft()
-        self._scheduler_task = asyncio.create_task(self._schedule())
+    def acquire(self, timeout: float | None = None) -> float:
+        """Take one token and return the delay to sleep before sending.
 
-    async def _schedule(self) -> None:
-        """Service waiters in FIFO order, one slot at a time."""
-        me = asyncio.current_task()
-        try:
-            while self._waiters:
-                now = time.monotonic()
-                # Cap drift so idle periods never accumulate more than *burst*
-                # free slots.
-                self._next_send = max(
-                    self._next_send, now - self._burst * self._interval
-                )
-                self._next_send += self._interval
-                delay = self._next_send - now
-                if delay > 0:
-                    await asyncio.sleep(delay)
-                if self._waiters:
-                    self._waiters.popleft().set()
-                else:
-                    # The waiter was cancelled while we slept; hand the slot
-                    # back rather than losing it to the drift cap.
-                    self._next_send -= self._interval
-        finally:
-            # Clear the reference -- even on cancellation -- so a later
-            # ``acquire`` restarts the scheduler, but never clobber a
-            # replacement: a scheduler stranded on an abandoned loop reaches
-            # this ``finally`` only when garbage collection closes it, by
-            # which time a new scheduler may already be registered.
-            if self._scheduler_task is me:
-                self._scheduler_task = None
+        The delay is the exact fractional deficit (not rounded to whole
+        intervals), so a caller never waits longer than the bucket needs.
+        When the delay would exceed *timeout*, the token is handed back and
+        :exc:`asyncio.TimeoutError` is raised instead, so a request that
+        could never be sent in time fails fast without consuming a slot.
+        """
+        self._refill()
+        self._tokens -= 1.0
+        delay = max(0.0, -self._tokens) * self._interval
+        if timeout is not None and delay > timeout:
+            self._tokens += 1.0
+            raise asyncio.TimeoutError(
+                f"rate limiter would delay the request {delay:.3f}s, "
+                f"beyond the {timeout:.3f}s timeout"
+            )
+        return delay
+
+    def release(self) -> None:
+        """Return one token, e.g. when a granted slot will not be used.
+
+        Called by the middleware when a caller is cancelled while sleeping
+        out its delay, so the unused slot goes back to the pool instead of
+        penalising later requests.
+        """
+        self._refill()
+        self._tokens = min(self._tokens + 1.0, float(self._burst))
 
 
 class RateLimitMiddleware:
     """Client middleware that throttles requests with a token bucket.
 
-    The middleware delays each outgoing request until the bucket grants it a
-    slot, so the client never sends faster than ``rate`` requests per second
-    (allowing short bursts of up to ``burst`` requests).
+    The middleware asks the bucket for a delay and sleeps it out before
+    sending, so the client never sends faster than ``rate`` requests per
+    second (allowing short bursts of up to ``burst`` requests). Slots are
+    granted in arrival order. When aiohttp exposes the request's total
+    timeout to the middleware (newer versions do), a wait that would exceed
+    it fails immediately with :exc:`asyncio.TimeoutError` instead of
+    sleeping toward a guaranteed timeout.
 
     Configuration is fixed at construction time: changing the attributes of an
     existing instance does not reconfigure buckets that were already built.
@@ -136,6 +112,11 @@ class RateLimitMiddleware:
     List ``RateLimitMiddleware`` last so that every request hitting the wire
     -- including such replays -- is throttled.
 
+    :param bucket: The :class:`TokenBucket` to throttle with. When ``None``
+        (default), one is built from ``rate`` and ``burst``. Mutually
+        exclusive with ``per_domain`` (per-domain mode builds one bucket per
+        host from ``rate`` and ``burst``).
+    :type bucket: TokenBucket or None
     :param float rate: Sustained request rate, in requests per second. Must be
         a positive, finite number.
     :param int burst: Number of requests allowed to go out back-to-back before
@@ -162,7 +143,7 @@ class RateLimitMiddleware:
         will fail with a timeout error instead of returning the 429 response.
     :type max_retry_after: float or None
     :raises ValueError: if ``rate``, ``burst`` or ``max_retry_after`` is out of
-        range.
+        range, or if ``bucket`` is combined with ``per_domain``.
     """
 
     rate: float
@@ -173,12 +154,19 @@ class RateLimitMiddleware:
 
     def __init__(
         self,
+        bucket: TokenBucket | None = None,
+        *,
         rate: float = 10.0,
         burst: int = 10,
         per_domain: bool = False,
         respect_retry_after: bool = True,
         max_retry_after: float | None = 60.0,
     ) -> None:
+        if bucket is not None and per_domain:
+            raise ValueError(
+                "bucket and per_domain are mutually exclusive; per-domain "
+                "buckets are built from rate and burst"
+            )
         if max_retry_after is not None and (
             not math.isfinite(max_retry_after) or max_retry_after < 0
         ):
@@ -192,7 +180,7 @@ class RateLimitMiddleware:
         self.respect_retry_after = respect_retry_after
         self.max_retry_after = max_retry_after
         # Building the global bucket validates rate/burst eagerly (fail fast).
-        self._global_bucket = TokenBucket(rate, burst)
+        self._global_bucket = bucket if bucket is not None else TokenBucket(rate, burst)
         self._domain_buckets: dict[str, TokenBucket] = defaultdict(
             lambda: TokenBucket(rate, burst)
         )
@@ -243,7 +231,22 @@ class RateLimitMiddleware:
     ) -> ClientResponse:
         """Run the request through the rate limiter."""
         bucket = self._get_bucket(request)
-        await bucket.acquire()
+        # aiohttp does not expose the request's ClientTimeout to middlewares
+        # yet: 3.x carries only the timer context, whose armed deadline
+        # cannot be read or rescheduled from here. When a version provides
+        # ``_timeout`` (current master does, privately), use its total as
+        # the bail bound so a wait that would blow the whole budget fails
+        # fast instead of sleeping toward a guaranteed timeout.
+        client_timeout = getattr(request, "_timeout", None)
+        delay = bucket.acquire(None if client_timeout is None else client_timeout.total)
+        if delay > 0.0:
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                # The granted slot will never be used; give it back so
+                # later requests are not penalised for it.
+                bucket.release()
+                raise
 
         response = await handler(request)
 
