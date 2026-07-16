@@ -4,12 +4,12 @@ import asyncio
 import gc
 import threading
 import time
-from typing import cast
 from unittest import mock
 
 import pytest
 from aiohttp import ClientRequest, web
 from pytest_aiohttp import AiohttpClient
+from yarl import URL
 
 from aiohttp_client_middlewares.rate_limit import RateLimitMiddleware, TokenBucket
 
@@ -25,10 +25,10 @@ def _make_app() -> web.Application:
 
 
 def _fake_request(host: str) -> ClientRequest:
-    """A stand-in ``ClientRequest`` exposing just ``.url.host``."""
-    req = mock.Mock()
-    req.url.host = host
-    return cast(ClientRequest, req)
+    """A stand-in ``ClientRequest`` exposing just ``.url``."""
+    req = mock.create_autospec(ClientRequest, instance=True)
+    req.url = URL(f"http://{host}")
+    return req  # type: ignore[no-any-return]
 
 
 def _retry_after_app(value: str) -> web.Application:
