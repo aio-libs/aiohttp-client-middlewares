@@ -24,13 +24,10 @@ Quickstart
 ----------
 
 Attach one or more middlewares to a session through the ``middlewares``
-argument. For HTTP Digest authentication:
+argument. For example, HTTP Digest authentication combined with
+client-side rate limiting:
 
-.. literalinclude:: code/digest_auth.py
-
-For client-side rate limiting:
-
-.. literalinclude:: code/rate_limit.py
+.. literalinclude:: code/index.py
 
 
 Contents
