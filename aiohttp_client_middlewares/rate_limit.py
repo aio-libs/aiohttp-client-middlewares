@@ -199,7 +199,11 @@ class RateLimitMiddleware:
 
     def _get_bucket(self, request: ClientRequest) -> TokenBucket:
         if self.per_domain:
-            domain = request.url.host or "unknown"
+            # aiohttp raises InvalidUrlClientError for host-less URLs before
+            # any middleware runs (on redirects too), so ``host`` is only
+            # ``None`` in the type; the assert narrows it for mypy.
+            domain = request.url.host
+            assert domain is not None
             return self._domain_buckets[domain]
         return self._global_bucket
 
