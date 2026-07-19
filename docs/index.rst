@@ -24,10 +24,20 @@ Quickstart
 ----------
 
 Attach one or more middlewares to a session through the ``middlewares``
-argument. For example, HTTP Digest authentication combined with
-client-side rate limiting:
+argument. HTTP Digest authentication:
 
 .. literalinclude:: code/index.py
+   :pyobject: digest_auth_example
+   :lines: 2-
+   :dedent:
+
+Client-side rate limiting (the limiter goes last so that internal replays,
+such as digest's 401 handshake, are throttled too):
+
+.. literalinclude:: code/index.py
+   :pyobject: rate_limit_example
+   :lines: 2-
+   :dedent:
 
 
 Contents

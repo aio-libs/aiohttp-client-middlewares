@@ -80,67 +80,54 @@ Digest authentication
 Rate limiting
 -------------
 
+.. class:: RateLimiter()
+
+   Abstract base class for rate-limit algorithms. Implementations provide the
+   synchronous ``acquire(timeout=None)``, which reserves a slot and returns
+   the delay, in seconds, to sleep before sending -- raising
+   :exc:`asyncio.TimeoutError` (and leaving the limiter untouched) when the
+   delay would exceed *timeout*. The async ``wait(timeout=None)`` method is
+   shared by all implementations: it acquires a slot, sleeps out the delay,
+   and hands the slot back through ``release()`` if the caller is cancelled
+   mid-sleep. ``release()`` defaults to a no-op for algorithms that have
+   nothing to return.
+
 .. class:: TokenBucket(rate=10.0, burst=10)
 
-   Synchronous token bucket: ``acquire()`` takes one token and returns the
-   delay, in seconds, the caller must sleep before sending. Tokens accrue
-   continuously at ``rate`` per second, capped at ``burst``; the count may go
-   negative, which is what queues callers up in arrival order. When a
-   *timeout* argument is given and the delay would exceed it, ``acquire``
-   hands the token back and raises :exc:`asyncio.TimeoutError` instead.
-   ``release()`` returns an unused token, e.g. for a caller cancelled while
-   sleeping out its delay. The bucket holds no tasks or loop state.
+   A :class:`RateLimiter`: tokens accrue continuously at ``rate`` per second,
+   capped at ``burst``; ``acquire()`` takes one token and the count may go
+   negative, which is what queues callers up in arrival order. The bucket
+   holds no tasks or loop state.
 
    :param float rate: Token accrual rate, in tokens per second. Must be a
       positive, finite number.
    :param int burst: Bucket capacity. Must be at least 1.
    :raises ValueError: if ``rate`` or ``burst`` is out of range.
 
-.. class:: RateLimitMiddleware(bucket=None, rate=10.0, burst=10, per_domain=False, respect_retry_after=True, max_retry_after=60.0)
+.. class:: RateLimitMiddleware(limiter, per_domain=False)
 
-   Client middleware that throttles outgoing requests with a token bucket.
+   Client middleware that throttles outgoing requests through a
+   :class:`RateLimiter`.
 
-   :param bucket: The :class:`TokenBucket` to throttle with; when ``None``
-      (default) one is built from ``rate`` and ``burst``. Mutually exclusive
-      with ``per_domain``, whose buckets are built from ``rate`` and
-      ``burst``.
-   :type bucket: TokenBucket or None
-   :param float rate: Sustained request rate, in requests per second. Must be
-      a positive, finite number.
-   :param int burst: Number of requests allowed to go out back-to-back before
-      throttling kicks in. Must be at least 1.
-   :param bool per_domain: Keep an independent bucket per target host instead
-      of a single global bucket. Buckets are keyed on the URL host only (port
+   :param limiter: The :class:`RateLimiter` to throttle with -- for example
+      ``TokenBucket(rate=5.0, burst=2)``. With ``per_domain=True``, pass a
+      zero-argument factory instead (for example
+      ``lambda: TokenBucket(rate=5.0)``); it is called once per target host,
+      the first time that host is seen.
+   :type limiter: RateLimiter or Callable[[], RateLimiter]
+   :param bool per_domain: Keep an independent limiter per target host instead
+      of a single global one. Limiters are keyed on the URL host only (port
       and scheme are not distinguished) and are never evicted, so only enable
       this for a bounded, trusted set of hosts.
-   :param bool respect_retry_after: Sleep for the duration of a numeric
-      ``Retry-After`` header on an HTTP 429 response before returning it to the
-      caller. Only the request that received the 429 sleeps -- concurrent
-      requests are not held back -- and the response is returned as-is
-      afterwards (there is no automatic retry). Other statuses that may carry
-      ``Retry-After`` (such as 503) are not inspected.
-   :param max_retry_after: Upper bound, in seconds, on how long a ``Retry-After``
-      header may make the client sleep (default ``60.0``; ``0.0`` disables the
-      sleep entirely). Must be ``None`` (no cap) or a non-negative, finite
-      number. A server-sent ``Retry-After`` that is itself non-finite
-      (``inf``/``nan``) or non-positive is always ignored, so a hostile server
-      cannot stall the client indefinitely. The sleep happens inside the request
-      and counts against the session's :class:`~aiohttp.ClientTimeout` (whose
-      default ``total`` is 300 seconds), so keep the cap well below your total
-      timeout or the request will fail with a timeout error instead of returning
-      the 429 response.
-   :type max_retry_after: float or None
+   :raises TypeError: if ``limiter`` does not match the mode: an instance is
+      required without ``per_domain``, a factory with it.
 
-   The middleware asks the bucket for a delay and sleeps it out before
-   sending, so the client never sends faster than ``rate`` requests per second
-   while still allowing short bursts of up to ``burst`` requests. Slots are
-   granted in arrival order. When aiohttp exposes the request's total timeout
-   to the middleware (newer versions do), a wait that would exceed it fails
-   immediately with :exc:`asyncio.TimeoutError` instead of sleeping toward a
-   guaranteed timeout.
-
-   Configuration is fixed at construction time: changing the attributes of an
-   existing instance does not reconfigure buckets that were already built.
+   The middleware waits on the limiter before sending, so the client never
+   sends faster than the limiter allows and slots are granted in arrival
+   order. When aiohttp exposes the request's total timeout to the middleware
+   (newer versions do), a wait that would exceed it fails immediately with
+   :exc:`asyncio.TimeoutError` instead of sleeping toward a guaranteed
+   timeout.
 
    Middleware order matters: middlewares listed earlier wrap the ones listed
    later, and a middleware that retries internally (for example,
@@ -149,9 +136,10 @@ Rate limiting
    that every request hitting the wire -- including such replays -- is
    throttled.
 
-   ``rate``, ``burst`` and ``max_retry_after`` are validated on construction and
-   raise :exc:`ValueError` if out of range.
 
    **Usage**
 
    .. literalinclude:: code/api.py
+      :pyobject: rate_limit_usage
+      :lines: 2-
+      :dedent:

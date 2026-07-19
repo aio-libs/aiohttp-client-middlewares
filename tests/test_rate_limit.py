@@ -10,7 +10,11 @@ from aiohttp import ClientRequest, ClientResponse, web
 from pytest_aiohttp import AiohttpClient
 from yarl import URL
 
-from aiohttp_client_middlewares.rate_limit import RateLimitMiddleware, TokenBucket
+from aiohttp_client_middlewares.rate_limit import (
+    RateLimiter,
+    RateLimitMiddleware,
+    TokenBucket,
+)
 
 
 async def _ok_handler(request: web.Request) -> web.Response:
@@ -28,17 +32,6 @@ def _fake_request(host: str) -> ClientRequest:
     req = mock.create_autospec(ClientRequest, instance=True)
     req.url = URL(f"http://{host}")
     return req  # type: ignore[no-any-return]
-
-
-def _retry_after_app(value: str) -> web.Application:
-    """An app whose single route always answers 429 with the given header."""
-
-    async def handler(request: web.Request) -> web.Response:
-        return web.Response(status=429, headers={"Retry-After": value})
-
-    app = web.Application()
-    app.router.add_get("/api", handler)
-    return app
 
 
 async def _cancel_and_join(task: "asyncio.Future[None]") -> None:
@@ -139,7 +132,7 @@ def test_token_bucket_release_caps_at_burst(clock: _FakeClock) -> None:
 
 async def test_rate_limit_middleware_throttles(aiohttp_client: AiohttpClient) -> None:
     """Global middleware should throttle requests beyond burst."""
-    middleware = RateLimitMiddleware(rate=50.0, burst=2)
+    middleware = RateLimitMiddleware(TokenBucket(rate=50.0, burst=2))
     client = await aiohttp_client(_make_app(), middlewares=(middleware,))
 
     start = time.monotonic()
@@ -155,7 +148,9 @@ async def test_rate_limit_middleware_throttles(aiohttp_client: AiohttpClient) ->
 
 async def test_rate_limit_middleware_per_domain(aiohttp_client: AiohttpClient) -> None:
     """Per-domain buckets should still throttle requests to the same host."""
-    middleware = RateLimitMiddleware(rate=100.0, burst=1, per_domain=True)
+    middleware = RateLimitMiddleware(
+        lambda: TokenBucket(rate=100.0, burst=1), per_domain=True
+    )
     client = await aiohttp_client(_make_app(), middlewares=(middleware,))
 
     start = time.monotonic()
@@ -167,92 +162,6 @@ async def test_rate_limit_middleware_per_domain(aiohttp_client: AiohttpClient) -
     assert resp1.status == 200
     assert resp2.status == 200
     assert 0.005 <= elapsed < 0.5
-
-
-async def test_rate_limit_middleware_respects_retry_after(
-    aiohttp_client: AiohttpClient,
-) -> None:
-    """The middleware should sleep on a 429 with a numeric ``Retry-After``."""
-    call_count = 0
-
-    async def rate_limited_handler(request: web.Request) -> web.Response:
-        nonlocal call_count
-        call_count += 1
-        if call_count <= 1:
-            return web.Response(status=429, headers={"Retry-After": "0.1"})
-        return web.Response(text="OK")
-
-    app = web.Application()
-    app.router.add_get("/api", rate_limited_handler)
-
-    middleware = RateLimitMiddleware(rate=100.0, burst=10, respect_retry_after=True)
-    client = await aiohttp_client(app, middlewares=(middleware,))
-
-    start = time.monotonic()
-    resp = await client.get("/api")
-    elapsed = time.monotonic() - start
-
-    assert resp.status == 429
-    assert 0.08 <= elapsed < 0.5
-
-
-async def test_retry_after_missing_header(aiohttp_client: AiohttpClient) -> None:
-    """A 429 without a ``Retry-After`` header is returned without sleeping."""
-
-    async def handler(request: web.Request) -> web.Response:
-        return web.Response(status=429)
-
-    app = web.Application()
-    app.router.add_get("/api", handler)
-    middleware = RateLimitMiddleware(rate=100.0, burst=10, respect_retry_after=True)
-    client = await aiohttp_client(app, middlewares=(middleware,))
-
-    start = time.monotonic()
-    resp = await client.get("/api")
-    elapsed = time.monotonic() - start
-
-    assert resp.status == 429
-    assert elapsed < 0.5  # nothing to wait on
-
-
-async def test_retry_after_non_numeric(aiohttp_client: AiohttpClient) -> None:
-    """A non-numeric ``Retry-After`` (HTTP-date) is ignored without sleeping."""
-
-    async def handler(request: web.Request) -> web.Response:
-        return web.Response(
-            status=429, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}
-        )
-
-    app = web.Application()
-    app.router.add_get("/api", handler)
-    middleware = RateLimitMiddleware(rate=100.0, burst=10, respect_retry_after=True)
-    client = await aiohttp_client(app, middlewares=(middleware,))
-
-    start = time.monotonic()
-    resp = await client.get("/api")
-    elapsed = time.monotonic() - start
-
-    assert resp.status == 429
-    assert elapsed < 0.5  # an HTTP-date is not parsed as seconds
-
-
-async def test_retry_after_disabled(aiohttp_client: AiohttpClient) -> None:
-    """With ``respect_retry_after=False`` a 429 + ``Retry-After`` is not honored."""
-
-    async def handler(request: web.Request) -> web.Response:
-        return web.Response(status=429, headers={"Retry-After": "5"})
-
-    app = web.Application()
-    app.router.add_get("/api", handler)
-    middleware = RateLimitMiddleware(rate=100.0, burst=10, respect_retry_after=False)
-    client = await aiohttp_client(app, middlewares=(middleware,))
-
-    start = time.monotonic()
-    resp = await client.get("/api")
-    elapsed = time.monotonic() - start
-
-    assert resp.status == 429
-    assert elapsed < 0.5  # respect_retry_after=False, so Retry-After: 5 is ignored
 
 
 # --- Input validation -------------------------------------------------------
@@ -268,8 +177,6 @@ def test_invalid_rate_raises(rate: float) -> None:
     """
     with pytest.raises(ValueError, match="rate"):
         TokenBucket(rate=rate, burst=1)
-    with pytest.raises(ValueError, match="rate"):
-        RateLimitMiddleware(rate=rate)
 
 
 @pytest.mark.parametrize("burst", [0, -1])
@@ -277,109 +184,34 @@ def test_invalid_burst_raises(burst: int) -> None:
     """A burst below 1 is rejected at construction time."""
     with pytest.raises(ValueError, match="burst"):
         TokenBucket(rate=10.0, burst=burst)
-    with pytest.raises(ValueError, match="burst"):
-        RateLimitMiddleware(burst=burst)
-
-
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), -1.0])
-def test_invalid_max_retry_after_raises(value: float) -> None:
-    """A non-finite or negative max_retry_after is rejected at construction."""
-    with pytest.raises(ValueError, match="max_retry_after"):
-        RateLimitMiddleware(max_retry_after=value)
-
-
-@pytest.mark.parametrize("value", [None, 0.0, 0.5, 300.0])
-def test_valid_max_retry_after_accepted(value: "float | None") -> None:
-    """None and any non-negative finite max_retry_after are accepted."""
-    middleware = RateLimitMiddleware(max_retry_after=value)
-    assert middleware.max_retry_after == value
-
-
-# --- Retry-After edge cases -------------------------------------------------
-
-
-@pytest.mark.parametrize("value", ["inf", "Infinity", "-inf", "nan", "0", "-5"])
-async def test_retry_after_non_finite_or_nonpositive_ignored(
-    aiohttp_client: AiohttpClient, value: str
-) -> None:
-    """inf/nan and non-positive Retry-After values must never make us sleep."""
-    middleware = RateLimitMiddleware(rate=100.0, burst=10)
-    client = await aiohttp_client(_retry_after_app(value), middlewares=(middleware,))
-
-    start = time.monotonic()
-    resp = await client.get("/api")
-    elapsed = time.monotonic() - start
-
-    assert resp.status == 429
-    assert elapsed < 0.2  # returned promptly, not stalled by a hostile header
-
-
-async def test_retry_after_clamped_to_max(aiohttp_client: AiohttpClient) -> None:
-    """A huge Retry-After is clamped down to ``max_retry_after``."""
-    middleware = RateLimitMiddleware(rate=100.0, burst=10, max_retry_after=0.1)
-    client = await aiohttp_client(_retry_after_app("3600"), middlewares=(middleware,))
-
-    start = time.monotonic()
-    resp = await client.get("/api")
-    elapsed = time.monotonic() - start
-
-    assert resp.status == 429
-    assert 0.08 <= elapsed < 0.5  # slept the 0.1s cap, not the requested hour
-
-
-async def test_retry_after_without_cap(aiohttp_client: AiohttpClient) -> None:
-    """``max_retry_after=None`` disables the clamp; a short wait is still honored."""
-    middleware = RateLimitMiddleware(rate=100.0, burst=10, max_retry_after=None)
-    client = await aiohttp_client(_retry_after_app("0.1"), middlewares=(middleware,))
-
-    start = time.monotonic()
-    resp = await client.get("/api")
-    elapsed = time.monotonic() - start
-
-    assert resp.status == 429
-    assert 0.08 <= elapsed < 0.5  # honored the ~0.1s wait with no cap applied
-
-
-async def test_retry_after_sleep_disabled_by_zero_cap(
-    aiohttp_client: AiohttpClient,
-) -> None:
-    """``max_retry_after=0.0`` disables the Retry-After sleep entirely."""
-    middleware = RateLimitMiddleware(rate=100.0, burst=10, max_retry_after=0.0)
-    client = await aiohttp_client(_retry_after_app("5"), middlewares=(middleware,))
-
-    start = time.monotonic()
-    resp = await client.get("/api")
-    elapsed = time.monotonic() - start
-
-    assert resp.status == 429
-    assert elapsed < 0.5  # would be ~5s if the header were honored
 
 
 # --- Per-domain vs global bucket selection ----------------------------------
 
 
-def test_per_domain_uses_distinct_buckets() -> None:
-    """``per_domain=True`` yields one bucket per host, reused per host."""
-    middleware = RateLimitMiddleware(rate=10.0, burst=1, per_domain=True)
+def test_per_domain_uses_distinct_limiters() -> None:
+    """``per_domain=True`` yields one limiter per host, reused per host."""
+    middleware = RateLimitMiddleware(
+        lambda: TokenBucket(rate=10.0, burst=1), per_domain=True
+    )
 
-    bucket_a = middleware._get_bucket(_fake_request("a.example"))
-    bucket_b = middleware._get_bucket(_fake_request("b.example"))
-    bucket_a_again = middleware._get_bucket(_fake_request("a.example"))
+    limiter_a = middleware._get_limiter(_fake_request("a.example"))
+    limiter_b = middleware._get_limiter(_fake_request("b.example"))
+    limiter_a_again = middleware._get_limiter(_fake_request("a.example"))
 
-    assert bucket_a is not bucket_b  # distinct hosts -> isolated buckets
-    assert bucket_a is bucket_a_again  # same host -> same bucket
-    assert len(middleware._domain_buckets) == 2
+    assert limiter_a is not limiter_b  # distinct hosts -> isolated limiters
+    assert limiter_a is limiter_a_again  # same host -> same limiter
+    assert len(middleware._domain_limiters) == 2
 
 
-def test_global_mode_shares_one_bucket() -> None:
-    """``per_domain=False`` (default) funnels every host through one bucket."""
-    middleware = RateLimitMiddleware(rate=10.0, burst=1, per_domain=False)
+def test_global_mode_shares_one_limiter() -> None:
+    """Without ``per_domain`` every host goes through the one limiter."""
+    middleware = RateLimitMiddleware(TokenBucket(rate=10.0, burst=1))
 
-    bucket_a = middleware._get_bucket(_fake_request("a.example"))
-    bucket_b = middleware._get_bucket(_fake_request("b.example"))
+    limiter_a = middleware._get_limiter(_fake_request("a.example"))
+    limiter_b = middleware._get_limiter(_fake_request("b.example"))
 
-    assert bucket_a is bucket_b is middleware._global_bucket
-    assert len(middleware._domain_buckets) == 0
+    assert limiter_a is limiter_b is middleware._global_limiter
 
 
 # --- New-design behavior ------------------------------------------------------
@@ -393,7 +225,7 @@ async def test_middleware_early_bail_on_timeout(aiohttp_client: AiohttpClient) -
     total timeout fires at 0.1s. Either way the caller gets a prompt
     ``asyncio.TimeoutError`` rather than a full 1s limiter sleep.
     """
-    middleware = RateLimitMiddleware(rate=1.0, burst=1)  # 1s between requests
+    middleware = RateLimitMiddleware(TokenBucket(rate=1.0, burst=1))  # 1s apart
     client = await aiohttp_client(_make_app(), middlewares=(middleware,))
 
     resp = await client.get("/api")  # consumes the burst slot
@@ -408,14 +240,15 @@ async def test_middleware_early_bail_on_timeout(aiohttp_client: AiohttpClient) -
 
 async def test_middleware_bails_before_sleeping_when_timeout_known() -> None:
     """With the request timeout visible, the limiter fails without sleeping."""
-    middleware = RateLimitMiddleware(rate=1.0, burst=1)  # 1s between requests
+    middleware = RateLimitMiddleware(TokenBucket(rate=1.0, burst=1))  # 1s apart
     request = _fake_request("example.com")
     request._timeout = aiohttp.ClientTimeout(total=0.05)  # type: ignore[attr-defined]
 
     async def handler(req: ClientRequest) -> ClientResponse:
         raise AssertionError("a doomed request must never be sent")
 
-    bucket = middleware._global_bucket
+    bucket = middleware._global_limiter
+    assert bucket is not None
     assert bucket.acquire() == 0.0  # drain the burst slot
 
     start = time.monotonic()
@@ -428,14 +261,15 @@ async def test_middleware_bails_before_sleeping_when_timeout_known() -> None:
 
 async def test_middleware_cancel_during_sleep_releases_slot() -> None:
     """A caller cancelled while sleeping hands its slot back to the bucket."""
-    middleware = RateLimitMiddleware(rate=5.0, burst=1)  # 0.2s interval
+    middleware = RateLimitMiddleware(TokenBucket(rate=5.0, burst=1))  # 0.2s interval
     request = _fake_request("example.com")
     request._timeout = aiohttp.ClientTimeout(total=None)  # type: ignore[attr-defined]
 
     async def handler(req: ClientRequest) -> ClientResponse:
         raise AssertionError("the cancelled request must never be sent")
 
-    bucket = middleware._global_bucket
+    bucket = middleware._global_limiter
+    assert bucket is not None
     assert bucket.acquire() == 0.0  # drain the burst slot
 
     task = asyncio.ensure_future(middleware(request, handler))
@@ -448,17 +282,23 @@ async def test_middleware_cancel_during_sleep_releases_slot() -> None:
     assert bucket.acquire() <= 0.2
 
 
-def test_bucket_injection_is_used_directly() -> None:
-    """A caller-provided bucket is throttling, not a copy of it."""
+def test_limiter_injection_is_used_directly() -> None:
+    """The caller-provided limiter is the one throttling, not a copy of it."""
     bucket = TokenBucket(rate=100.0, burst=1)
     middleware = RateLimitMiddleware(bucket)
-    assert middleware._global_bucket is bucket
+    assert middleware._global_limiter is bucket
 
 
-def test_bucket_with_per_domain_rejected() -> None:
-    """A single injected bucket contradicts per-domain isolation."""
-    with pytest.raises(ValueError, match="mutually exclusive"):
+def test_instance_with_per_domain_rejected() -> None:
+    """A single limiter instance contradicts per-domain isolation."""
+    with pytest.raises(TypeError, match="factory"):
         RateLimitMiddleware(TokenBucket(rate=1.0, burst=1), per_domain=True)
+
+
+def test_factory_without_per_domain_rejected() -> None:
+    """A factory makes no sense in global mode; require the instance."""
+    with pytest.raises(TypeError, match="RateLimiter instance"):
+        RateLimitMiddleware(lambda: TokenBucket(rate=1.0, burst=1))
 
 
 def test_token_bucket_needs_no_event_loop() -> None:
@@ -466,3 +306,31 @@ def test_token_bucket_needs_no_event_loop() -> None:
     bucket = TokenBucket(rate=1000.0, burst=1)
     assert bucket.acquire() == 0.0
     assert bucket.acquire() > 0.0
+
+
+# --- RateLimiter base class ---------------------------------------------------
+
+
+class _FixedDelay(RateLimiter):
+    """Minimal limiter: fixed delay, inherits the no-op ``release``."""
+
+    def __init__(self, delay: float) -> None:
+        self._delay = delay
+
+    def acquire(self, timeout: "float | None" = None) -> float:
+        return self._delay
+
+
+async def test_rate_limiter_wait_zero_delay_returns_immediately() -> None:
+    """A zero delay never touches the event loop's sleep."""
+    start = time.monotonic()
+    await _FixedDelay(0.0).wait()
+    assert time.monotonic() - start < 0.05
+
+
+async def test_rate_limiter_wait_cancel_uses_default_release() -> None:
+    """Cancellation during the shared sleep runs the base no-op release."""
+    limiter = _FixedDelay(5.0)
+    task = asyncio.ensure_future(limiter.wait())
+    await asyncio.sleep(0.05)  # the wait is now sleeping out its delay
+    await _cancel_and_join(task)
