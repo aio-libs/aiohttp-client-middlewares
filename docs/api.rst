@@ -83,14 +83,15 @@ Rate limiting
 .. class:: RateLimiter()
 
    Abstract base class for rate-limit algorithms. Implementations provide the
-   synchronous ``acquire(timeout=None)``, which reserves a slot and returns
-   the delay, in seconds, to sleep before sending -- raising
-   :exc:`asyncio.TimeoutError` (and leaving the limiter untouched) when the
-   delay would exceed *timeout*. The async ``wait(timeout=None)`` method is
-   shared by all implementations: it acquires a slot, sleeps out the delay,
-   and hands the slot back through ``release()`` if the caller is cancelled
-   mid-sleep. ``release()`` defaults to a no-op for algorithms that have
-   nothing to return.
+   synchronous ``acquire()``, which reserves a slot and returns the delay, in
+   seconds, to sleep before sending, and ``clone()``, which returns a fresh
+   limiter with the same configuration (used once per host by per-domain
+   mode). The async ``wait(timeout=None)`` method is shared by all
+   implementations: it acquires a slot, fails fast with
+   :exc:`asyncio.TimeoutError` -- handing the slot back -- when the delay
+   would exceed *timeout*, sleeps out the delay otherwise, and hands the slot
+   back if the caller is cancelled mid-sleep. ``release()`` defaults to a
+   no-op for algorithms that have nothing to return.
 
 .. class:: TokenBucket(rate=10.0, burst=10)
 
@@ -109,18 +110,15 @@ Rate limiting
    Client middleware that throttles outgoing requests through a
    :class:`RateLimiter`.
 
-   :param limiter: The :class:`RateLimiter` to throttle with -- for example
-      ``TokenBucket(rate=5.0, burst=2)``. With ``per_domain=True``, pass a
-      zero-argument factory instead (for example
-      ``lambda: TokenBucket(rate=5.0)``); it is called once per target host,
-      the first time that host is seen.
-   :type limiter: RateLimiter or Callable[[], RateLimiter]
+   :param RateLimiter limiter: The :class:`RateLimiter` to throttle with --
+      for example ``TokenBucket(rate=5.0, burst=2)``. With ``per_domain=True``
+      it acts as a template: each target host gets ``limiter.clone()`` the
+      first time that host is seen.
    :param bool per_domain: Keep an independent limiter per target host instead
       of a single global one. Limiters are keyed on the URL host only (port
       and scheme are not distinguished) and are never evicted, so only enable
       this for a bounded, trusted set of hosts.
-   :raises TypeError: if ``limiter`` does not match the mode: an instance is
-      required without ``per_domain``, a factory with it.
+   :raises TypeError: if ``limiter`` is not a :class:`RateLimiter`.
 
    The middleware waits on the limiter before sending, so the client never
    sends faster than the limiter allows and slots are granted in arrival

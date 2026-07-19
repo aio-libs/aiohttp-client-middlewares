@@ -14,7 +14,6 @@ import math
 import time
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import Callable
 
 from aiohttp import ClientHandlerType, ClientRequest, ClientResponse
 
@@ -22,33 +21,48 @@ from aiohttp import ClientHandlerType, ClientRequest, ClientResponse
 class RateLimiter(ABC):
     """Base class for rate-limit algorithms.
 
-    Implementations provide the synchronous :meth:`acquire`; the async
-    sleeping logic lives here in :meth:`wait`, shared by every algorithm.
-    Because :meth:`acquire` is synchronous, callers on one event loop
-    reserve slots atomically in arrival order.
+    Implementations provide the synchronous :meth:`acquire` and
+    :meth:`clone`; the async sleeping and timeout logic live here in
+    :meth:`wait`, shared by every algorithm. Because :meth:`acquire` is
+    synchronous, callers on one event loop reserve slots atomically in
+    arrival order.
     """
 
     @abstractmethod
-    def acquire(self, timeout: float | None = None) -> float:
-        """Reserve a slot and return the delay to sleep before sending.
+    def acquire(self) -> float:
+        """Reserve a slot and return the delay to sleep before sending."""
 
-        When the delay would exceed *timeout*, the limiter state must be
-        left untouched and :exc:`asyncio.TimeoutError` raised instead, so a
-        request that could never be sent in time fails fast without
-        consuming a slot.
+    @abstractmethod
+    def clone(self) -> "RateLimiter":
+        """Return a fresh limiter with the same configuration.
+
+        Per-domain mode clones the configured limiter once per target
+        host, so state (queued slots, accrued tokens) must not carry over.
         """
 
     def release(self) -> None:
         """Hand back a reserved slot that will not be used.
 
-        Called by :meth:`wait` when the caller is cancelled while sleeping
-        out its delay. The default is a no-op for algorithms that have
-        nothing to return.
+        Called by :meth:`wait` when the reserved slot cannot be used:
+        the delay would exceed the caller's timeout, or the caller is
+        cancelled while sleeping. The default is a no-op for algorithms
+        that have nothing to return.
         """
 
     async def wait(self, timeout: float | None = None) -> None:
-        """Reserve a slot and sleep out its delay."""
-        delay = self.acquire(timeout)
+        """Reserve a slot and sleep out its delay.
+
+        When the delay would exceed *timeout*, the slot is handed back and
+        :exc:`asyncio.TimeoutError` is raised without sleeping, so a
+        request that could never be sent in time fails fast.
+        """
+        delay = self.acquire()
+        if timeout is not None and delay > timeout:
+            self.release()
+            raise asyncio.TimeoutError(
+                f"rate limiter would delay the request {delay:.3f}s, "
+                f"beyond the {timeout:.3f}s timeout"
+            )
         if delay > 0.0:
             try:
                 await asyncio.sleep(delay)
@@ -80,6 +94,7 @@ class TokenBucket(RateLimiter):
         self._interval = 1.0 / rate
         if not math.isfinite(self._interval):
             raise ValueError(f"rate is too small, got {rate!r}")
+        self._rate = rate
         self._burst = float(burst)
         # Start full so the first ``burst`` acquires are instant.
         self._tokens = self._burst
@@ -93,24 +108,19 @@ class TokenBucket(RateLimiter):
         )
         self._last_refill = now
 
-    def acquire(self, timeout: float | None = None) -> float:
+    def acquire(self) -> float:
         """Take one token and return the delay to sleep before sending.
 
         The delay is the exact fractional deficit (not rounded to whole
         intervals), so a caller never waits longer than the bucket needs.
-        When the delay would exceed *timeout*, the token is handed back and
-        :exc:`asyncio.TimeoutError` is raised instead.
         """
         self._refill()
         self._tokens -= 1.0
-        delay = max(0.0, -self._tokens) * self._interval
-        if timeout is not None and delay > timeout:
-            self._tokens += 1.0
-            raise asyncio.TimeoutError(
-                f"rate limiter would delay the request {delay:.3f}s, "
-                f"beyond the {timeout:.3f}s timeout"
-            )
-        return delay
+        return max(0.0, -self._tokens) * self._interval
+
+    def clone(self) -> "TokenBucket":
+        """Return a fresh, full bucket with the same rate and burst."""
+        return TokenBucket(rate=self._rate, burst=int(self._burst))
 
     def release(self) -> None:
         """Return one token to the bucket."""
@@ -135,43 +145,32 @@ class RateLimitMiddleware:
     List ``RateLimitMiddleware`` last so that every request hitting the wire
     -- including such replays -- is throttled.
 
-    :param limiter: The :class:`RateLimiter` to throttle with -- for example
-        ``TokenBucket(rate=5.0, burst=2)``. With ``per_domain=True``, pass a
-        zero-argument factory instead (for example ``lambda:
-        TokenBucket(rate=5.0)``); it is called once per target host, the
-        first time that host is seen.
-    :type limiter: RateLimiter or Callable[[], RateLimiter]
+    :param RateLimiter limiter: The :class:`RateLimiter` to throttle with --
+        for example ``TokenBucket(rate=5.0, burst=2)``. With
+        ``per_domain=True`` it acts as a template: each target host gets
+        ``limiter.clone()`` the first time that host is seen.
     :param bool per_domain: When ``True``, keep an independent limiter per
         target host instead of a single global one. Limiters are keyed on the
         URL host only (port and scheme are not distinguished) and are never
         evicted, so only enable this for a bounded, trusted set of hosts.
-    :raises TypeError: if ``limiter`` does not match the mode: an instance is
-        required without ``per_domain``, a factory with it.
+    :raises TypeError: if ``limiter`` is not a :class:`RateLimiter`.
     """
 
     per_domain: bool
 
     def __init__(
         self,
-        limiter: "RateLimiter | Callable[[], RateLimiter]",
+        limiter: RateLimiter,
         *,
         per_domain: bool = False,
     ) -> None:
+        if not isinstance(limiter, RateLimiter):
+            raise TypeError(f"limiter must be a RateLimiter, got {limiter!r}")
         self.per_domain = per_domain
         self._global_limiter: RateLimiter | None = None
         if per_domain:
-            if isinstance(limiter, RateLimiter) or not callable(limiter):
-                raise TypeError(
-                    "per_domain mode builds one limiter per host: pass a "
-                    "zero-argument factory such as lambda: TokenBucket(rate=5.0)"
-                )
-            self._domain_limiters: dict[str, RateLimiter] = defaultdict(limiter)
+            self._domain_limiters: dict[str, RateLimiter] = defaultdict(limiter.clone)
         else:
-            if not isinstance(limiter, RateLimiter):
-                raise TypeError(
-                    "limiter must be a RateLimiter instance (pass a factory "
-                    "only together with per_domain=True)"
-                )
             self._global_limiter = limiter
 
     def _get_limiter(self, request: ClientRequest) -> RateLimiter:

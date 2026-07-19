@@ -95,22 +95,22 @@ def test_token_bucket_refills_after_idle(clock: _FakeClock) -> None:
     assert bucket.acquire() == pytest.approx(0.1)  # the cap held
 
 
-def test_token_bucket_timeout_bail_returns_token(clock: _FakeClock) -> None:
-    """A doomed acquire raises TimeoutError and does not consume a slot."""
+async def test_wait_timeout_bail_returns_slot(clock: _FakeClock) -> None:
+    """A doomed wait raises TimeoutError without consuming a slot."""
     bucket = TokenBucket(rate=10.0, burst=1)
     bucket.acquire()
     with pytest.raises(asyncio.TimeoutError):
-        bucket.acquire(timeout=0.05)  # would need 0.1s
-    # The failed acquire handed its token back: the next caller owes one
+        await bucket.wait(timeout=0.05)  # would need 0.1s
+    # The failed wait handed its token back: the next caller owes one
     # interval, not two.
     assert bucket.acquire() == pytest.approx(0.1)
 
 
-def test_token_bucket_acquire_within_timeout(clock: _FakeClock) -> None:
+async def test_wait_within_timeout_sleeps_out_the_delay() -> None:
     """A delay inside the timeout budget is granted normally."""
-    bucket = TokenBucket(rate=10.0, burst=1)
+    bucket = TokenBucket(rate=1000.0, burst=1)
     bucket.acquire()
-    assert bucket.acquire(timeout=1.0) == pytest.approx(0.1)
+    await bucket.wait(timeout=1.0)  # ~1ms delay, well within budget
 
 
 def test_token_bucket_release_returns_token(clock: _FakeClock) -> None:
@@ -148,9 +148,7 @@ async def test_rate_limit_middleware_throttles(aiohttp_client: AiohttpClient) ->
 
 async def test_rate_limit_middleware_per_domain(aiohttp_client: AiohttpClient) -> None:
     """Per-domain buckets should still throttle requests to the same host."""
-    middleware = RateLimitMiddleware(
-        lambda: TokenBucket(rate=100.0, burst=1), per_domain=True
-    )
+    middleware = RateLimitMiddleware(TokenBucket(rate=100.0, burst=1), per_domain=True)
     client = await aiohttp_client(_make_app(), middlewares=(middleware,))
 
     start = time.monotonic()
@@ -191,9 +189,7 @@ def test_invalid_burst_raises(burst: int) -> None:
 
 def test_per_domain_uses_distinct_limiters() -> None:
     """``per_domain=True`` yields one limiter per host, reused per host."""
-    middleware = RateLimitMiddleware(
-        lambda: TokenBucket(rate=10.0, burst=1), per_domain=True
-    )
+    middleware = RateLimitMiddleware(TokenBucket(rate=10.0, burst=1), per_domain=True)
 
     limiter_a = middleware._get_limiter(_fake_request("a.example"))
     limiter_b = middleware._get_limiter(_fake_request("b.example"))
@@ -289,16 +285,23 @@ def test_limiter_injection_is_used_directly() -> None:
     assert middleware._global_limiter is bucket
 
 
-def test_instance_with_per_domain_rejected() -> None:
-    """A single limiter instance contradicts per-domain isolation."""
-    with pytest.raises(TypeError, match="factory"):
-        RateLimitMiddleware(TokenBucket(rate=1.0, burst=1), per_domain=True)
+def test_non_limiter_rejected() -> None:
+    """Anything that is not a RateLimiter instance is rejected eagerly."""
+    with pytest.raises(TypeError, match="RateLimiter"):
+        RateLimitMiddleware(lambda: TokenBucket(rate=1.0, burst=1))  # type: ignore[arg-type]
 
 
-def test_factory_without_per_domain_rejected() -> None:
-    """A factory makes no sense in global mode; require the instance."""
-    with pytest.raises(TypeError, match="RateLimiter instance"):
-        RateLimitMiddleware(lambda: TokenBucket(rate=1.0, burst=1))
+def test_token_bucket_clone_is_fresh(clock: _FakeClock) -> None:
+    """``clone`` copies the configuration, never the drained state."""
+    template = TokenBucket(rate=10.0, burst=2)
+    template.acquire()
+    template.acquire()
+    assert template.acquire() > 0.0  # template drained into debt
+
+    fresh = template.clone()
+    assert fresh.acquire() == 0.0  # full burst again
+    assert fresh.acquire() == 0.0
+    assert fresh.acquire() == pytest.approx(0.1)  # same rate as the template
 
 
 def test_token_bucket_needs_no_event_loop() -> None:
@@ -317,8 +320,11 @@ class _FixedDelay(RateLimiter):
     def __init__(self, delay: float) -> None:
         self._delay = delay
 
-    def acquire(self, timeout: "float | None" = None) -> float:
+    def acquire(self) -> float:
         return self._delay
+
+    def clone(self) -> "_FixedDelay":
+        return _FixedDelay(self._delay)
 
 
 async def test_rate_limiter_wait_zero_delay_returns_immediately() -> None:
@@ -334,3 +340,9 @@ async def test_rate_limiter_wait_cancel_uses_default_release() -> None:
     task = asyncio.ensure_future(limiter.wait())
     await asyncio.sleep(0.05)  # the wait is now sleeping out its delay
     await _cancel_and_join(task)
+
+
+async def test_rate_limiter_wait_timeout_uses_default_release() -> None:
+    """The base timeout bail calls release(); the default no-op suffices."""
+    with pytest.raises(asyncio.TimeoutError):
+        await _FixedDelay(5.0).wait(timeout=0.1)
