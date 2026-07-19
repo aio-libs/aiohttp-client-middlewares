@@ -47,16 +47,16 @@ class TokenBucket:
         self._interval = 1.0 / rate
         if not math.isfinite(self._interval):
             raise ValueError(f"rate is too small, got {rate!r}")
-        self._burst = burst
+        self._burst = float(burst)
         # Start full so the first ``burst`` acquires are instant.
-        self._tokens = float(burst)
+        self._tokens = self._burst
         self._last_refill = time.monotonic()
 
     def _refill(self) -> None:
         now = time.monotonic()
         self._tokens = min(
             self._tokens + (now - self._last_refill) / self._interval,
-            float(self._burst),
+            self._burst,
         )
         self._last_refill = now
 
@@ -88,7 +88,7 @@ class TokenBucket:
         penalising later requests.
         """
         self._refill()
-        self._tokens = min(self._tokens + 1.0, float(self._burst))
+        self._tokens = min(self._tokens + 1.0, self._burst)
 
 
 class RateLimitMiddleware:
