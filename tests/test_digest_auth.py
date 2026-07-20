@@ -4,6 +4,7 @@ Vendored from aiohttp (tests/test_client_middleware_digest_auth.py),
 Apache-2.0; keep in sync with upstream.
 """
 
+import hashlib
 import io
 import re
 import time
@@ -23,7 +24,7 @@ from aiohttp_client_middlewares.digest_auth import (
     _HEADER_PAIRS_PATTERN,
     DigestAuthChallenge,
     DigestAuthMiddleware,
-    DigestFunctions,
+    _resolve_hash_name,
     escape_quotes,
     parse_header_pairs,
     unescape_quotes,
@@ -347,10 +348,10 @@ def compute_expected_digest(
     cnonce: str,
     body: str = "",
 ) -> str:
-    hash_fn = DigestFunctions[algorithm]
+    hash_name = _resolve_hash_name(algorithm.upper())
 
     def H(x: str) -> str:
-        return hash_fn(x.encode()).hexdigest()
+        return hashlib.new(hash_name, x.encode()).hexdigest()
 
     def KD(secret: str, data: str) -> str:
         return H(f"{secret}:{data}")
@@ -374,7 +375,27 @@ def compute_expected_digest(
 
 
 @pytest.mark.parametrize("qop", ["auth", "auth-int", "auth,auth-int", ""])
-@pytest.mark.parametrize("algorithm", sorted(DigestFunctions.keys()))
+@pytest.mark.parametrize(
+    "algorithm",
+    [
+        "MD5",
+        "MD5-SESS",
+        "SHA",
+        "SHA-SESS",
+        "SHA256",
+        "SHA256-SESS",
+        "SHA-256",
+        "SHA-256-SESS",
+        "SHA512",
+        "SHA512-SESS",
+        "SHA-512",
+        "SHA-512-SESS",
+        # Beyond the RFC 7616 registry: anything hashlib knows works now.
+        "SHA-512-256",
+        "SHA-512-256-SESS",
+        "SHA3-256",
+    ],
+)
 @pytest.mark.parametrize(
     ("body", "body_str"),
     [
