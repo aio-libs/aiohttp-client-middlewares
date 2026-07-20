@@ -1,0 +1,5 @@
+Added :class:`~aiohttp_client_middlewares.SSRFMiddleware` and
+:class:`~aiohttp_client_middlewares.SSRFConnector`, a two-layer defense against
+server-side request forgery -- the connector validates every resolved address
+(IP-literals, DNS answers, and each redirect hop) while the middleware enforces
+URL-scheme and hostname rules -- by :user:`rodrigobnogueira`.
