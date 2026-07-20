@@ -1,0 +1,1 @@
+Fixed ``escape_quotes`` in ``DigestAuthMiddleware`` not escaping backslashes, so a ``WWW-Authenticate`` challenge value containing a backslash could break out of its quoted-string in the generated ``Authorization`` header -- by :user:`dxbjavid`.

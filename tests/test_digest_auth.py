@@ -4,6 +4,7 @@ Vendored from aiohttp (tests/test_client_middleware_digest_auth.py),
 Apache-2.0; keep in sync with upstream.
 """
 
+import hashlib
 import io
 import re
 import time
@@ -23,7 +24,7 @@ from aiohttp_client_middlewares.digest_auth import (
     _HEADER_PAIRS_PATTERN,
     DigestAuthChallenge,
     DigestAuthMiddleware,
-    DigestFunctions,
+    _resolve_hash_name,
     escape_quotes,
     parse_header_pairs,
     unescape_quotes,
@@ -347,10 +348,10 @@ def compute_expected_digest(
     cnonce: str,
     body: str = "",
 ) -> str:
-    hash_fn = DigestFunctions[algorithm]
+    hash_name = _resolve_hash_name(algorithm.upper())
 
     def H(x: str) -> str:
-        return hash_fn(x.encode()).hexdigest()
+        return hashlib.new(hash_name, x.encode()).hexdigest()
 
     def KD(secret: str, data: str) -> str:
         return H(f"{secret}:{data}")
@@ -374,7 +375,27 @@ def compute_expected_digest(
 
 
 @pytest.mark.parametrize("qop", ["auth", "auth-int", "auth,auth-int", ""])
-@pytest.mark.parametrize("algorithm", sorted(DigestFunctions.keys()))
+@pytest.mark.parametrize(
+    "algorithm",
+    [
+        "MD5",
+        "MD5-SESS",
+        "SHA",
+        "SHA-SESS",
+        "SHA256",
+        "SHA256-SESS",
+        "SHA-256",
+        "SHA-256-SESS",
+        "SHA512",
+        "SHA512-SESS",
+        "SHA-512",
+        "SHA-512-SESS",
+        # Beyond the RFC 7616 registry: anything hashlib knows works now.
+        "SHA-512-256",
+        "SHA-512-256-SESS",
+        "SHA3-256",
+    ],
+)
 @pytest.mark.parametrize(
     ("body", "body_str"),
     [
@@ -553,6 +574,32 @@ async def test_escaping_quotes_in_auth_header() -> None:
     assert 'opaque="opaque\\"with\\"quotes"' in header
 
 
+async def test_backslash_in_challenge_cannot_break_quoting() -> None:
+    """A backslash in a server-supplied value must not escape the closing quote."""
+    auth = DigestAuthMiddleware("bob", "secret")
+    # A malicious/compromised server could return directives ending in a
+    # backslash; without escaping it the trailing quote of the field would be
+    # turned into an escaped quote, letting the value run into later directives.
+    auth._challenge = DigestAuthChallenge(
+        realm="realm\\",
+        nonce="n0",
+        qop="auth",
+        algorithm="MD5",
+        opaque="op\\",
+    )
+
+    header = await auth._encode("GET", URL("http://example.com/path"), b"")
+
+    assert 'realm="realm\\\\"' in header
+    assert 'opaque="op\\\\"' in header
+    # Re-parsing the header must recover the exact realm value, i.e. the
+    # backslash did not consume the closing quote and swallow ``nonce``.
+    params = parse_header_pairs(header[len("Digest ") :])
+    assert params["realm"] == "realm\\"
+    assert params["nonce"] == "n0"
+    assert params["opaque"] == "op\\"
+
+
 async def test_template_based_header_construction(
     auth_mw_with_challenge: DigestAuthMiddleware,
     mock_sha1_digest: mock.MagicMock,
@@ -626,7 +673,9 @@ async def test_template_based_header_construction(
         ),
         ('""', '\\"\\"', "Just double quotes"),
         ('"', '\\"', "Single double quote"),
-        ('already\\"escaped', 'already\\\\"escaped', "Already escaped quotes"),
+        ('already\\"escaped', 'already\\\\\\"escaped', "Already escaped quotes"),
+        ("back\\slash", "back\\\\slash", "Embedded backslash"),
+        ("trailing\\", "trailing\\\\", "Trailing backslash"),
     ],
 )
 def test_quote_escaping_functions(
