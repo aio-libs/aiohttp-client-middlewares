@@ -123,8 +123,8 @@ Rate limiting
    The middleware waits on the limiter before sending, so the client never
    sends faster than the limiter allows and slots are granted in arrival
    order. When aiohttp exposes the request's total timeout to the middleware
-   (newer versions do), a wait that would exceed it fails immediately with
-   :exc:`asyncio.TimeoutError` instead of sleeping toward a guaranteed
+   (aiohttp 3.15 and newer), a wait that would exceed it fails immediately
+   with :exc:`asyncio.TimeoutError` instead of sleeping toward a guaranteed
    timeout.
 
    Middleware order matters: middlewares listed earlier wrap the ones listed

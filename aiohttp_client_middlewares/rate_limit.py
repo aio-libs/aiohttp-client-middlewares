@@ -134,8 +134,8 @@ class RateLimitMiddleware:
     The middleware waits on the limiter before sending, so the client never
     sends faster than the limiter allows and slots are granted in arrival
     order. When aiohttp exposes the request's total timeout to the middleware
-    (newer versions do), a wait that would exceed it fails immediately with
-    :exc:`asyncio.TimeoutError` instead of sleeping toward a guaranteed
+    (aiohttp 3.15 and newer), a wait that would exceed it fails immediately
+    with :exc:`asyncio.TimeoutError` instead of sleeping toward a guaranteed
     timeout.
 
     Middleware order matters: middlewares listed earlier wrap the ones listed
@@ -190,11 +190,9 @@ class RateLimitMiddleware:
     ) -> ClientResponse:
         """Run the request through the rate limiter."""
         limiter = self._get_limiter(request)
-        # aiohttp does not expose the request's ClientTimeout publicly yet:
-        # 3.x carries only the private ``_timeout``. Prefer the public
-        # read-only ``timeout`` attribute once a version provides it.
-        client_timeout = getattr(request, "timeout", None) or getattr(
-            request, "_timeout", None
-        )
+        # ``ClientRequest.timeout`` is public and read-only since aiohttp
+        # 3.15 (aio-libs/aiohttp#13176); older releases have no such
+        # attribute at all, so the limiter waits without a budget there.
+        client_timeout = getattr(request, "timeout", None)
         await limiter.wait(None if client_timeout is None else client_timeout.total)
         return await handler(request)

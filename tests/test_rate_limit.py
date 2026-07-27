@@ -216,10 +216,10 @@ def test_global_mode_shares_one_limiter() -> None:
 async def test_middleware_early_bail_on_timeout(aiohttp_client: AiohttpClient) -> None:
     """A request whose wait exceeds its total timeout fails promptly.
 
-    On aiohttp versions that expose the request timeout to middlewares the
-    limiter bails before sleeping at all; on today's 3.x the session's own
-    total timeout fires at 0.1s. Either way the caller gets a prompt
-    ``asyncio.TimeoutError`` rather than a full 1s limiter sleep.
+    On aiohttp 3.15 and newer, where ``ClientRequest.timeout`` is public,
+    the limiter bails before sleeping at all; on older releases the
+    session's own total timeout fires at 0.1s. Either way the caller gets a
+    prompt ``asyncio.TimeoutError`` rather than a full 1s limiter sleep.
     """
     middleware = RateLimitMiddleware(TokenBucket(rate=1.0, burst=1))  # 1s apart
     client = await aiohttp_client(_make_app(), middlewares=(middleware,))
@@ -238,7 +238,8 @@ async def test_middleware_bails_before_sleeping_when_timeout_known() -> None:
     """With the request timeout visible, the limiter fails without sleeping."""
     middleware = RateLimitMiddleware(TokenBucket(rate=1.0, burst=1))  # 1s apart
     request = _fake_request("example.com")
-    request._timeout = aiohttp.ClientTimeout(total=0.05)  # type: ignore[attr-defined]
+    # The public attribute aiohttp 3.15+ provides (aio-libs/aiohttp#13176).
+    request.timeout = aiohttp.ClientTimeout(total=0.05)  # type: ignore[attr-defined]
 
     async def handler(req: ClientRequest) -> ClientResponse:
         raise AssertionError("a doomed request must never be sent")
@@ -259,7 +260,7 @@ async def test_middleware_cancel_during_sleep_releases_slot() -> None:
     """A caller cancelled while sleeping hands its slot back to the bucket."""
     middleware = RateLimitMiddleware(TokenBucket(rate=5.0, burst=1))  # 0.2s interval
     request = _fake_request("example.com")
-    request._timeout = aiohttp.ClientTimeout(total=None)  # type: ignore[attr-defined]
+    request.timeout = aiohttp.ClientTimeout(total=None)  # type: ignore[attr-defined]
 
     async def handler(req: ClientRequest) -> ClientResponse:
         raise AssertionError("the cancelled request must never be sent")
