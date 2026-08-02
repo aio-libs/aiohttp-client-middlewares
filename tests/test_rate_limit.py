@@ -27,10 +27,18 @@ def _make_app() -> web.Application:
     return app
 
 
-def _fake_request(host: str) -> ClientRequest:
-    """A stand-in ``ClientRequest`` exposing just ``.url``."""
+def _fake_request(
+    host: str, timeout: aiohttp.ClientTimeout | None = None
+) -> ClientRequest:
+    """A stand-in ``ClientRequest`` exposing just ``.url`` and ``.timeout``.
+
+    The timeout is set here, while the mock is still untyped, rather than on
+    the returned value: ``ClientRequest.timeout`` is a read-only property, so
+    assigning it through the ``ClientRequest`` annotation does not type-check.
+    """
     req = mock.create_autospec(ClientRequest, instance=True)
     req.url = URL(f"http://{host}")
+    req.timeout = aiohttp.ClientTimeout() if timeout is None else timeout
     return req  # type: ignore[no-any-return]
 
 
@@ -237,9 +245,7 @@ async def test_middleware_early_bail_on_timeout(aiohttp_client: AiohttpClient) -
 async def test_middleware_bails_before_sleeping_when_timeout_known() -> None:
     """With the request timeout visible, the limiter fails without sleeping."""
     middleware = RateLimitMiddleware(TokenBucket(rate=1.0, burst=1))  # 1s apart
-    request = _fake_request("example.com")
-    # The public attribute aiohttp 3.15+ provides (aio-libs/aiohttp#13176).
-    request.timeout = aiohttp.ClientTimeout(total=0.05)  # type: ignore[attr-defined]
+    request = _fake_request("example.com", aiohttp.ClientTimeout(total=0.05))
 
     async def handler(req: ClientRequest) -> ClientResponse:
         raise AssertionError("a doomed request must never be sent")
@@ -259,8 +265,7 @@ async def test_middleware_bails_before_sleeping_when_timeout_known() -> None:
 async def test_middleware_cancel_during_sleep_releases_slot() -> None:
     """A caller cancelled while sleeping hands its slot back to the bucket."""
     middleware = RateLimitMiddleware(TokenBucket(rate=5.0, burst=1))  # 0.2s interval
-    request = _fake_request("example.com")
-    request.timeout = aiohttp.ClientTimeout(total=None)  # type: ignore[attr-defined]
+    request = _fake_request("example.com", aiohttp.ClientTimeout(total=None))
 
     async def handler(req: ClientRequest) -> ClientResponse:
         raise AssertionError("the cancelled request must never be sent")
