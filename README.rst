@@ -30,8 +30,8 @@ ready-to-use *client* middlewares for ``aiohttp``. It currently provides:
 
 - ``DigestAuthMiddleware`` -- HTTP Digest authentication, vendored from
   aiohttp core; this package is the canonical home for it going forward.
-- ``RateLimitMiddleware`` -- client-side token-bucket rate limiting with
-  optional per-domain buckets and ``Retry-After`` handling.
+- ``RateLimitMiddleware`` -- client-side rate limiting with a pluggable
+  algorithm (a token bucket is included) and optional per-domain limiters.
 
 Middlewares plug into ``aiohttp.ClientSession`` through the client
 middleware API introduced in aiohttp 3.12, so they can wrap every outgoing

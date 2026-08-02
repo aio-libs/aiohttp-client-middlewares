@@ -31,8 +31,9 @@ argument. HTTP Digest authentication:
    :lines: 2-
    :dedent:
 
-Client-side rate limiting (the limiter goes last so that internal replays,
-such as digest's 401 handshake, are throttled too):
+Client-side rate limiting (when combined with other middlewares, list the
+limiter last so that internal replays, such as digest's 401 handshake, are
+throttled too):
 
 .. literalinclude:: code/index.py
    :pyobject: rate_limit_example
