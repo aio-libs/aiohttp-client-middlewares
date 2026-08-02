@@ -26,11 +26,22 @@ class RateLimiter(ABC):
     :meth:`wait`, shared by every algorithm. Because :meth:`acquire` is
     synchronous, callers on one event loop reserve slots atomically in
     arrival order.
+
+    A limiter that needs I/O to reserve a slot -- one backed by Redis or a
+    database, say -- overrides :meth:`wait` rather than :meth:`acquire`:
+    ``wait`` is the only method the middleware calls and is already a
+    coroutine. Such an implementation owns what it takes over: ordering
+    between concurrent callers, charging the round trip against *timeout*,
+    and handing the slot back when the caller goes away.
     """
 
     @abstractmethod
     def acquire(self) -> float:
-        """Reserve a slot and return the delay to sleep before sending."""
+        """Reserve a slot and return the delay to sleep before sending.
+
+        Must return without awaiting: the arrival-order guarantee above
+        holds precisely because there is no suspension point here.
+        """
 
     @abstractmethod
     def clone(self) -> "RateLimiter":
@@ -47,6 +58,10 @@ class RateLimiter(ABC):
         the delay would exceed the caller's timeout, or the caller is
         cancelled while sleeping. The default is a no-op for algorithms
         that have nothing to return.
+
+        Runs from an ``except asyncio.CancelledError`` block, so it must
+        not await either: a second cancellation, or the loop shutting
+        down, would truncate it part-way and lose the slot for good.
         """
 
     async def wait(self, timeout: float | None = None) -> None:
@@ -55,6 +70,9 @@ class RateLimiter(ABC):
         When the delay would exceed *timeout*, the slot is handed back and
         :exc:`asyncio.TimeoutError` is raised without sleeping, so a
         request that could never be sent in time fails fast.
+
+        This is the method the middleware calls, and the one to override
+        when reserving a slot needs I/O of its own.
         """
         delay = self.acquire()
         if timeout is not None and delay > timeout:

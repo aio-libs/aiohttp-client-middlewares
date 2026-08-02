@@ -93,6 +93,17 @@ Rate limiting
    back if the caller is cancelled mid-sleep. ``release()`` defaults to a
    no-op for algorithms that have nothing to return.
 
+   Neither ``acquire()`` nor ``release()`` may await. Their being synchronous
+   is what reserves slots atomically, in arrival order, across concurrent
+   callers on one event loop, and ``release()`` additionally runs from a
+   cancellation handler, where an awaiting implementation can be truncated
+   and lose the slot. A limiter that needs I/O to reserve a slot -- one
+   backed by Redis or a database, say -- overrides ``wait()`` instead: it is
+   the only method the middleware calls and is already a coroutine. Such an
+   implementation takes on ordering between concurrent callers, charging its
+   round trip against *timeout*, and returning the slot when the caller goes
+   away.
+
 .. class:: TokenBucket(rate=10.0, burst=10)
 
    A :class:`RateLimiter`: tokens accrue continuously at ``rate`` per second,
