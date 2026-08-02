@@ -27,7 +27,7 @@ classifiers = [
 ]
 requires-python = ">= 3.10"
 dependencies = [
-  "aiohttp >= 3.12",
+  "aiohttp >= 3.15",
   "yarl >= 1.17.0",
 ]
 dynamic = [

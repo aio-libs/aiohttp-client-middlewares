@@ -240,10 +240,9 @@ def test_per_domain_is_readable_and_read_only(per_domain: bool) -> None:
 async def test_middleware_early_bail_on_timeout(aiohttp_client: AiohttpClient) -> None:
     """A request whose wait exceeds its total timeout fails promptly.
 
-    On aiohttp 3.15 and newer, where ``ClientRequest.timeout`` is public,
-    the limiter bails before sleeping at all; on older releases the
-    session's own total timeout fires at 0.1s. Either way the caller gets a
-    prompt ``asyncio.TimeoutError`` rather than a full 1s limiter sleep.
+    The limiter reads the budget off the request and bails before sleeping
+    at all, so the caller gets an ``asyncio.TimeoutError`` rather than
+    sleeping out the limiter's full 1s delay.
     """
     middleware = RateLimitMiddleware(TokenBucket(rate=1.0, burst=1))  # 1s apart
     client = await aiohttp_client(_make_app(), middlewares=(middleware,))

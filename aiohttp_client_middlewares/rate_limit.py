@@ -15,7 +15,7 @@ import time
 from abc import ABC, abstractmethod
 from collections import defaultdict
 
-from aiohttp import ClientHandlerType, ClientRequest, ClientResponse, ClientTimeout
+from aiohttp import ClientHandlerType, ClientRequest, ClientResponse
 
 
 class RateLimiter(ABC):
@@ -159,10 +159,9 @@ class RateLimitMiddleware:
     order. Cancellation is the one exception: a slot handed back by
     :meth:`RateLimiter.release` frees capacity that queued callers have
     already been given fixed delays against, so two of them can briefly
-    send in the same instant. When aiohttp exposes the request's timeout
-    (aiohttp 3.15 and newer), a wait that would exceed it fails immediately
-    with :exc:`asyncio.TimeoutError` instead of sleeping toward a guaranteed
-    timeout.
+    send in the same instant. A wait that would exceed the request's total
+    timeout fails immediately with :exc:`asyncio.TimeoutError` instead of
+    sleeping toward a guaranteed timeout.
 
     Middleware order matters: middlewares listed earlier wrap the ones listed
     later, and a middleware that retries internally (for example,
@@ -223,13 +222,5 @@ class RateLimitMiddleware:
     ) -> ClientResponse:
         """Run the request through the rate limiter."""
         limiter = self._get_limiter(request)
-        # ``ClientRequest.timeout`` is public and read-only since aiohttp
-        # 3.15 (aio-libs/aiohttp#13176); older releases have no such
-        # attribute at all, so the limiter waits without a budget there.
-        # The annotation keeps the value type-checked even though the
-        # attribute cannot be resolved statically on 3.12 to 3.14. Dropping
-        # the getattr() is gated on raising the floor to 3.15; that change
-        # is ready in #23 and waits only on the aiohttp release.
-        client_timeout: ClientTimeout | None = getattr(request, "timeout", None)
-        await limiter.wait(None if client_timeout is None else client_timeout.total)
+        await limiter.wait(request.timeout.total)
         return await handler(request)
