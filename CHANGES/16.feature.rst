@@ -1,0 +1,4 @@
+:class:`~aiohttp_client_middlewares.DigestAuthMiddleware` now accepts any hash
+algorithm available in :mod:`hashlib` (resolved through :func:`hashlib.new`),
+such as ``SHA-512-256`` from :rfc:`7616` or ``SHA3-256``, instead of a fixed
+set of algorithms -- by :user:`rodrigobnogueira`.

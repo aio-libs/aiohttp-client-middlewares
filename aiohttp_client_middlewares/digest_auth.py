@@ -2,9 +2,10 @@
 Digest authentication middleware for aiohttp client.
 
 This middleware implements HTTP Digest Authentication according to RFC 7616,
-providing a more secure alternative to Basic Authentication. It supports all
-standard hash algorithms including MD5, SHA, SHA-256, SHA-512 and their session
-variants, as well as both 'auth' and 'auth-int' quality of protection (qop) options.
+providing a more secure alternative to Basic Authentication. It supports any
+hash algorithm available in :mod:`hashlib` -- including MD5, SHA, SHA-256,
+SHA-512, SHA-512-256 and their session variants -- as well as both 'auth' and
+'auth-int' quality of protection (qop) options.
 """
 
 import hashlib
@@ -12,7 +13,6 @@ import os
 import re
 import sys
 import time
-from collections.abc import Callable
 from typing import Final, Literal, TypedDict
 
 from aiohttp import (
@@ -36,20 +36,25 @@ class DigestAuthChallenge(TypedDict, total=False):
     stale: str
 
 
-DigestFunctions: dict[str, Callable[[bytes], "hashlib._Hash"]] = {
-    "MD5": hashlib.md5,
-    "MD5-SESS": hashlib.md5,
-    "SHA": hashlib.sha1,
-    "SHA-SESS": hashlib.sha1,
-    "SHA256": hashlib.sha256,
-    "SHA256-SESS": hashlib.sha256,
-    "SHA-256": hashlib.sha256,
-    "SHA-256-SESS": hashlib.sha256,
-    "SHA512": hashlib.sha512,
-    "SHA512-SESS": hashlib.sha512,
-    "SHA-512": hashlib.sha512,
-    "SHA-512-SESS": hashlib.sha512,
-}
+def _resolve_hash_name(algorithm: str) -> str:
+    """Resolve an uppercase Digest ``algorithm`` token for :func:`hashlib.new`.
+
+    The ``-SESS`` variants use the same hash as their base algorithm, and
+    :rfc:`2617` spelled SHA-1 as ``SHA``. RFC algorithm names carry dashes
+    (``SHA-256``) where hashlib does not (``sha256``), while OpenSSL knows
+    ``sha512-256`` only with its dash -- so try the token verbatim, then
+    with the first dash removed.
+    """
+    name = algorithm.removesuffix("-SESS")
+    if name == "SHA":
+        name = "SHA1"
+    for candidate in (name, name.replace("-", "", 1)):
+        try:
+            hashlib.new(candidate)
+        except ValueError:
+            continue
+        return candidate
+    raise ClientError(f"Digest auth error: Unsupported hash algorithm: {algorithm}")
 
 
 # Compile the regex pattern once at module level for performance
@@ -89,10 +94,6 @@ CHALLENGE_FIELDS: Final[
     "stale",
 )
 
-# Supported digest authentication algorithms
-# Use a tuple of sorted keys for predictable documentation and error messages
-SUPPORTED_ALGORITHMS: Final[tuple[str, ...]] = tuple(sorted(DigestFunctions.keys()))
-
 # RFC 7616: Fields that require quoting in the Digest auth header
 # These fields must be enclosed in double quotes in the Authorization header.
 # Algorithm, qop, and nc are never quoted per RFC specifications.
@@ -104,13 +105,13 @@ QUOTED_AUTH_FIELDS: Final[frozenset[str]] = frozenset(
 
 
 def escape_quotes(value: str) -> str:
-    """Escape double quotes for HTTP header values."""
-    return value.replace('"', '\\"')
+    """Escape backslashes and double quotes for HTTP quoted-strings."""
+    return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def unescape_quotes(value: str) -> str:
-    """Unescape double quotes in HTTP header values."""
-    return value.replace('\\"', '"')
+    """Unescape backslashes and double quotes in HTTP quoted-strings."""
+    return value.replace('\\"', '"').replace("\\\\", "\\")
 
 
 def parse_header_pairs(header: str) -> dict[str, str]:
@@ -165,11 +166,8 @@ class DigestAuthMiddleware:
 
     Features:
     - Handles all aspects of Digest authentication handshake automatically
-    - Supports all standard hash algorithms:
-      - MD5, MD5-SESS
-      - SHA, SHA-SESS
-      - SHA256, SHA256-SESS, SHA-256, SHA-256-SESS
-      - SHA512, SHA512-SESS, SHA-512, SHA-512-SESS
+    - Supports any hash algorithm available in :mod:`hashlib`, e.g. MD5,
+      SHA, SHA-256, SHA-512, SHA-512-256 and their -SESS session variants
     - Supports 'auth' and 'auth-int' quality of protection modes
     - Properly handles quoted strings and parameter parsing
     - Includes replay attack protection with client nonce count tracking
@@ -291,16 +289,11 @@ class DigestAuthMiddleware:
             qop = "auth-int" if "auth-int" in valid_qops else "auth"
             qop_bytes = qop.encode("utf-8")
 
-        if algorithm not in DigestFunctions:
-            raise ClientError(
-                f"Digest auth error: Unsupported hash algorithm: {algorithm}. "
-                f"Supported algorithms: {', '.join(SUPPORTED_ALGORITHMS)}"
-            )
-        hash_fn: Final = DigestFunctions[algorithm]
+        hash_name: Final = _resolve_hash_name(algorithm)
 
         def H(x: bytes) -> bytes:
             """RFC 7616 Section 3: Hash function H(data) = hex(hash(data))."""
-            return hash_fn(x).hexdigest().encode()
+            return hashlib.new(hash_name, x).hexdigest().encode()
 
         def KD(s: bytes, d: bytes) -> bytes:
             """RFC 7616 Section 3: KD(secret, data) = H(concat(secret, ":", data))."""
