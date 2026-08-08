@@ -8,6 +8,9 @@ This package collects ready-to-use middlewares for
 
 - :class:`~aiohttp_client_middlewares.DigestAuthMiddleware` -- HTTP Digest
   authentication.
+- :class:`~aiohttp_client_middlewares.SSRFMiddleware`, paired with the
+  :class:`~aiohttp_client_middlewares.SSRFConnector` it requires -- server-side
+  request forgery (SSRF) protection.
 
 
 Installation
@@ -24,7 +27,18 @@ Quickstart
 Attach a middleware to a session through the ``middlewares`` argument and
 let it handle authentication for every request:
 
-.. literalinclude:: code/digest_auth.py
+.. literalinclude:: code/index.py
+   :pyobject: digest_auth_example
+   :lines: 2-
+   :dedent:
+
+For SSRF protection, combine the connector (which validates every resolved
+address) with the middleware (which enforces URL-level rules):
+
+.. literalinclude:: code/index.py
+   :pyobject: ssrf_example
+   :lines: 2-
+   :dedent:
 
 
 Contents
