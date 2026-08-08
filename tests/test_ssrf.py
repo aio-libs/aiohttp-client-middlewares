@@ -1,6 +1,8 @@
 """Tests for the SSRF protection middleware and connector."""
 
+import copy
 import inspect
+import pickle
 from ipaddress import ip_address
 from typing import cast
 from unittest import mock
@@ -89,6 +91,8 @@ def _fake_results(*ips: str) -> "list[ResolveResult]":
         "::",  # IPv6 unspecified
         "fe80::1",  # IPv6 link-local
         "fc00::1",  # unique-local
+        "fec0::1",  # site-local (RFC 3879); ipaddress reports is_global=True
+        "fec0:0:0:ffff::1",  # historical well-known site-local DNS server
         "fd00:ec2::254",  # AWS IPv6 metadata endpoint (unique-local)
         "ff02::1",  # IPv6 multicast
         "64:ff9b::808:808",  # NAT64-mapped: routes into an IPv4 translator
@@ -130,7 +134,9 @@ def test_public_addresses_allowed(address: str) -> None:
         ("☃.internal", "xn--n3h.internal"),  # Unicode -> punycode
         ("xn--n3h.internal", "xn--n3h.internal"),  # already punycode (idempotent)
         ("127.0.0.1", "127.0.0.1"),  # IP literal untouched
-        ("a" * 70 + ".example", "a" * 70 + ".example"),  # un-encodable -> fallback
+        ("::1", "::1"),  # IPv6 literal untouched
+        ("a" * 70 + ".example", "a" * 70 + ".example"),  # oversized label is fine
+        ("☃" * 100, "☃" * 100),  # too long to encode -> falls back as-is
     ],
 )
 def test_normalize_host(host: str, expected: str) -> None:
@@ -272,7 +278,7 @@ async def test_one_idn_rule_matches_both_layers() -> None:
         await middleware(_fake_request("http://☃.example/"), _forbidden_handler)
 
     # Connector sees the punycode host aiohttp passes to _resolve_host.
-    connector = SSRFConnector(allowlist=["☃.internal"])  # ☃.internal
+    connector = SSRFConnector(exempt_hosts=["☃.internal"])  # ☃.internal
     try:
         with mock.patch.object(
             TCPConnector,
@@ -280,7 +286,7 @@ async def test_one_idn_rule_matches_both_layers() -> None:
             mock.AsyncMock(return_value=_fake_results("10.0.0.5")),
         ):
             resolved = await connector._resolve_host("xn--n3h.internal", 80)
-            assert len(resolved) == 1  # allowlisted -> internal address exempt
+            assert len(resolved) == 1  # exempt -> internal address allowed
     finally:
         await connector.close()
 
@@ -331,9 +337,9 @@ async def test_connector_fails_closed_on_unparsable_result() -> None:
         await connector.close()
 
 
-async def test_connector_allowlisted_hostname_skips_checks() -> None:
-    """An allowlisted hostname is trusted regardless of what it resolves to."""
-    connector = SSRFConnector(allowlist=["internal.example.com"])
+async def test_connector_exempt_hostname_skips_checks() -> None:
+    """An exempt hostname is trusted regardless of what it resolves to."""
+    connector = SSRFConnector(exempt_hosts=["internal.example.com"])
     results = _fake_results("10.0.0.5")
     try:
         with mock.patch.object(
@@ -345,9 +351,9 @@ async def test_connector_allowlisted_hostname_skips_checks() -> None:
         await connector.close()
 
 
-async def test_connector_allowlisted_network_permits_addresses_inside_it() -> None:
-    """A CIDR allowlist entry exempts resolved addresses inside it only."""
-    connector = SSRFConnector(allowlist=["10.0.0.0/8"])
+async def test_connector_exempt_network_permits_addresses_inside_it() -> None:
+    """A CIDR exemption covers resolved addresses inside it only."""
+    connector = SSRFConnector(exempt_hosts=["10.0.0.0/8"])
     try:
         with mock.patch.object(
             TCPConnector,
@@ -370,7 +376,146 @@ def test_resolve_host_override_matches_aiohttp_signature() -> None:
     """Fail loudly if aiohttp changes the ``_resolve_host`` signature."""
     ours = inspect.signature(SSRFConnector._resolve_host)
     theirs = inspect.signature(TCPConnector._resolve_host)
-    assert list(ours.parameters) == list(theirs.parameters)
+    # Names alone would not notice a parameter changing kind, so compare both.
+    assert [(p.name, p.kind) for p in ours.parameters.values()] == [
+        (p.name, p.kind) for p in theirs.parameters.values()
+    ]
+
+
+# --- Rule parsing: a malformed rule must never become a silent no-op ----------
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        ["10.0.0.0/33"],  # impossible prefix length
+        ["203.0.113.0/244"],  # transposed digits
+        [" 192.168.1.0/24"],  # stray leading space
+        ["192.168.1.0/24 "],  # stray trailing space
+        ["*.evil.example"],  # glob, which is not supported
+        ["10.0.0.0/8,127.0.0.0/8"],  # comma-joined config value
+        ["http://victim.example"],  # a URL pasted instead of a host
+        ["victim.example:8080"],  # host:port instead of a host
+        [""],  # blank line from a config file
+    ],
+)
+def test_malformed_rule_entry_raises(entries: "list[str]") -> None:
+    """A rule that cannot be parsed raises instead of matching nothing."""
+    with pytest.raises((ValueError, TypeError)):
+        SSRFMiddleware(denylist=entries)
+
+
+@pytest.mark.parametrize("kwarg", ["allowlist", "denylist"])
+def test_bare_string_rule_rejected(kwarg: str) -> None:
+    """A bare string would be read one character at a time, so reject it."""
+    with pytest.raises(TypeError, match="one character at a time"):
+        # No ignore needed: ``str`` satisfies ``Iterable[str]``, which is
+        # exactly why this has to be caught at runtime.
+        SSRFMiddleware(**{kwarg: "victim.example"})
+
+
+def test_bare_string_exempt_hosts_rejected() -> None:
+    """The connector rejects a bare string for the same reason."""
+    with pytest.raises(TypeError, match="one character at a time"):
+        SSRFConnector(exempt_hosts="internal.example")
+
+
+def test_bare_string_schemes_rejected() -> None:
+    """``allowed_schemes="https"`` would allow the letters h, t, p and s."""
+    with pytest.raises(TypeError, match="string"):
+        SSRFMiddleware(allowed_schemes="https")
+
+
+# --- Non-canonical IPv4 literals ----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "0x7f000001",  # hex; aiohttp accepts it and the resolver reaches 127.0.0.1
+        "2130706433",  # decimal
+        "127.1",  # short form
+        "0177.0.0.1",  # octal
+    ],
+)
+async def test_middleware_blocks_non_canonical_loopback(host: str) -> None:
+    """Legacy inet_aton spellings of 127.0.0.1 are judged as addresses.
+
+    The connector cannot help when a forward proxy is configured, because it
+    only ever resolves the proxy, so the middleware has to recognise these.
+    """
+    middleware = SSRFMiddleware()
+    with pytest.raises(SSRFError, match="not publicly routable"):
+        await middleware(_fake_request(f"http://{host}/"), _forbidden_handler)
+
+
+async def test_middleware_still_passes_numeric_looking_public_ip() -> None:
+    """The non-canonical parser must not block legitimate public addresses."""
+    response = await _middleware_call_ok("http://8.8.8.8/", SSRFMiddleware())
+    assert response is not None
+
+
+# --- Schemes ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("scheme", ["ws", "wss"])
+async def test_middleware_allows_websocket_schemes(scheme: str) -> None:
+    """``ws_connect`` runs the middleware chain, so ws/wss must pass."""
+    response = await _middleware_call_ok(
+        f"{scheme}://example.com/socket", SSRFMiddleware()
+    )
+    assert response is not None
+
+
+# --- Exception behaviour ------------------------------------------------------
+
+
+def test_ssrf_error_survives_pickle_and_copy() -> None:
+    """The error crosses process boundaries and can be deep-copied."""
+    err = SSRFError("victim.internal", "resolved to non-public address")
+    for restored in (pickle.loads(pickle.dumps(err)), copy.copy(err)):
+        assert restored.host == err.host
+        assert restored.reason == err.reason
+        assert str(restored) == str(err)
+
+
+async def test_ssrf_error_host_is_a_host_not_a_url() -> None:
+    """``host`` stays a host when the URL has one, even for a scheme block."""
+    middleware = SSRFMiddleware(allowed_schemes=("https",))
+    with pytest.raises(SSRFError) as excinfo:
+        await middleware(_fake_request("http://example.com/p"), _forbidden_handler)
+    assert excinfo.value.host == "example.com"
+
+
+async def test_ssrf_error_strips_credentials() -> None:
+    """A hostless URL is reported without leaking userinfo into logs."""
+    middleware = SSRFMiddleware()
+    req = mock.Mock()
+    # yarl cannot build a hostless URL that still carries userinfo, so stand
+    # one in: the point is that the raise site goes through ``with_user``.
+    req.url = mock.Mock(scheme="http", host=None)
+    req.url.with_user.return_value = URL("http://example.com/")
+    with pytest.raises(SSRFError, match="no host") as excinfo:
+        await middleware(cast(ClientRequest, req), _forbidden_handler)
+    req.url.with_user.assert_called_once_with(None)
+    assert "hunter2" not in str(excinfo.value)
+
+
+# --- IDNA: one rule really must match in both layers --------------------------
+
+
+@pytest.mark.parametrize("entry", ["faß.example", "xn--fa-hia.example"])
+async def test_idna_rule_matches_where_2003_and_uts46_diverge(entry: str) -> None:
+    """``ß`` is the case the stdlib idna codec would get wrong.
+
+    IDNA 2003 folds it to ``ss`` while yarl's UTS-46 keeps it, so a rule
+    normalized with the stdlib codec would match in neither layer.
+    """
+    middleware = SSRFMiddleware(denylist=[entry])
+    with pytest.raises(SSRFError, match="denylisted"):
+        await middleware(_fake_request("http://faß.example/"), _forbidden_handler)
+    # The connector is handed the punycode form aiohttp puts in raw_host.
+    assert _normalize_host(entry) == URL("http://faß.example/").raw_host
 
 
 # --- End to end against a local server ----------------------------------------
@@ -386,12 +531,12 @@ async def test_connector_blocks_local_server_by_default(
             await session.get(server.make_url("/api"))
 
 
-async def test_connector_allowlist_reenables_local_server(
+async def test_connector_exemption_reenables_local_server(
     aiohttp_server: AiohttpServer,
 ) -> None:
-    """A CIDR allowlist entry deliberately re-enables a local target."""
+    """A CIDR exemption deliberately re-enables a local target."""
     server = await aiohttp_server(_ok_app())
-    connector = SSRFConnector(allowlist=["127.0.0.0/8"])
+    connector = SSRFConnector(exempt_hosts=["127.0.0.0/8"])
     async with ClientSession(connector=connector) as session:
         async with session.get(server.make_url("/api")) as resp:
             assert resp.status == 200
@@ -409,7 +554,7 @@ async def test_connector_blocks_redirect_hop(aiohttp_server: AiohttpServer) -> N
     server = await aiohttp_server(app)
     target.append(server.make_url("/api"))  # http://127.0.0.1:<port>/api
 
-    connector = SSRFConnector(allowlist=["localhost"])
+    connector = SSRFConnector(exempt_hosts=["localhost"])
     async with ClientSession(connector=connector) as session:
         with pytest.raises(SSRFError, match="127.0.0.1"):
             await session.get(f"http://localhost:{server.port}/redirect")

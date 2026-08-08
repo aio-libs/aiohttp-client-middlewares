@@ -6,7 +6,7 @@ starting with HTTP Digest authentication and server-side request forgery
 """
 
 from .digest_auth import DigestAuthMiddleware
-from .ssrf import SSRFConnector, SSRFError, SSRFMiddleware
+from .ssrf import SSRFConnector, SSRFError, SSRFMiddleware, is_unsafe_address
 
 __version__ = "0.1.0"
 
@@ -15,4 +15,5 @@ __all__ = (
     "SSRFConnector",
     "SSRFError",
     "SSRFMiddleware",
+    "is_unsafe_address",
 )
