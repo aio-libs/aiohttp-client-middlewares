@@ -75,3 +75,88 @@ Digest authentication
            # The middleware automatically handles the digest auth handshake.
            async with session.get("http://protected.example.com") as resp:
                assert resp.status == 200
+
+
+Rate limiting
+-------------
+
+.. class:: RateLimiter()
+
+   Abstract base class for rate-limit algorithms. Implementations provide the
+   synchronous ``acquire()``, which reserves a slot and returns the delay, in
+   seconds, to sleep before sending, and ``clone()``, which returns a fresh
+   limiter with the same configuration (used once per host by per-domain
+   mode). The async ``wait(timeout=None)`` method is shared by all
+   implementations: it acquires a slot, fails fast with
+   :exc:`asyncio.TimeoutError` -- handing the slot back -- when the delay
+   would exceed *timeout*, sleeps out the delay otherwise, and hands the slot
+   back if the caller is cancelled mid-sleep. ``release()`` defaults to a
+   no-op for algorithms that have nothing to return.
+
+   Neither ``acquire()`` nor ``release()`` may await. Their being synchronous
+   is what reserves slots atomically, in arrival order, across concurrent
+   callers on one event loop, and ``release()`` additionally runs from a
+   cancellation handler, where an awaiting implementation can be truncated
+   and lose the slot. A limiter that needs I/O to reserve a slot -- one
+   backed by Redis or a database, say -- overrides ``wait()`` instead: it is
+   the only method the middleware calls and is already a coroutine. Such an
+   implementation takes on ordering between concurrent callers, charging its
+   round trip against *timeout*, and returning the slot when the caller goes
+   away. ``acquire()`` and ``clone()`` are abstract either way, so it still
+   has to define both to be instantiable; its ``acquire()`` is never called
+   and can simply raise, while ``clone()`` is used for real by
+   ``per_domain=True``.
+
+.. class:: TokenBucket(rate=10.0, burst=10)
+
+   A :class:`RateLimiter`: tokens accrue continuously at ``rate`` per second,
+   capped at ``burst``; ``acquire()`` takes one token and the count may go
+   negative, which is what queues callers up in arrival order. The bucket
+   holds no tasks or loop state.
+
+   :param float rate: Token accrual rate, in tokens per second. Must be a
+      positive, finite number.
+   :param int burst: Bucket capacity. Must be at least 1.
+   :raises ValueError: if ``rate`` or ``burst`` is out of range.
+
+.. class:: RateLimitMiddleware(limiter, per_domain=False)
+
+   Client middleware that throttles outgoing requests through a
+   :class:`RateLimiter`.
+
+   :param RateLimiter limiter: The :class:`RateLimiter` to throttle with --
+      for example ``TokenBucket(rate=5.0, burst=2)``. With ``per_domain=True``
+      it acts as a template: each target host gets ``limiter.clone()`` the
+      first time that host is seen.
+   :param bool per_domain: Keep an independent limiter per target host instead
+      of a single global one. Limiters are keyed on the URL host only (port
+      and scheme are not distinguished) and are never evicted, so only enable
+      this for a bounded, trusted set of hosts. Redirects count, so the set of
+      hosts is not entirely under the caller's control. Readable afterwards as
+      the read-only ``per_domain`` attribute.
+   :raises TypeError: if ``limiter`` is not a :class:`RateLimiter`.
+
+   The middleware waits on the limiter before sending, so the client never
+   sends faster than the limiter allows and slots are granted in arrival
+   order. Cancellation is the one exception: a slot handed back by
+   ``release()`` frees capacity that queued callers already hold fixed delays
+   against, so two of them can briefly send in the same instant. When aiohttp
+   exposes the request's total timeout to the middleware
+   (aiohttp 3.15 and newer), a wait that would exceed it fails immediately
+   with :exc:`asyncio.TimeoutError` instead of sleeping toward a guaranteed
+   timeout.
+
+   Middleware order matters: middlewares listed earlier wrap the ones listed
+   later, and a middleware that retries internally (for example,
+   :class:`DigestAuthMiddleware` replaying a request after a 401) re-invokes
+   only the middlewares listed *after* it. List ``RateLimitMiddleware`` last so
+   that every request hitting the wire -- including such replays -- is
+   throttled.
+
+
+   **Usage**
+
+   .. literalinclude:: code/api.py
+      :pyobject: rate_limit_usage
+      :lines: 2-
+      :dedent:
