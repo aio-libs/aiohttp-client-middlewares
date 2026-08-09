@@ -213,7 +213,8 @@ class RateLimitMiddleware:
         # attribute at all, so the limiter waits without a budget there.
         # The annotation keeps the value type-checked even though the
         # attribute cannot be resolved statically on 3.12 to 3.14. Dropping
-        # the getattr() is gated on raising the floor to 3.15.
+        # the getattr() is gated on raising the floor to 3.15; that change
+        # is ready in #23 and waits only on the aiohttp release.
         client_timeout: ClientTimeout | None = getattr(request, "timeout", None)
         await limiter.wait(None if client_timeout is None else client_timeout.total)
         return await handler(request)
