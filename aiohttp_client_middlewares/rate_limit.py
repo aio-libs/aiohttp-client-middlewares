@@ -33,6 +33,11 @@ class RateLimiter(ABC):
     coroutine. Such an implementation owns what it takes over: ordering
     between concurrent callers, charging the round trip against *timeout*,
     and handing the slot back when the caller goes away.
+
+    :meth:`acquire` and :meth:`clone` stay abstract either way, so an
+    implementation that overrides :meth:`wait` still has to define both to
+    be instantiable. Its :meth:`acquire` is never called and can simply
+    raise; :meth:`clone` is called for real by ``per_domain=True``.
     """
 
     @abstractmethod
@@ -151,7 +156,10 @@ class RateLimitMiddleware:
 
     The middleware waits on the limiter before sending, so the client never
     sends faster than the limiter allows and slots are granted in arrival
-    order. When aiohttp exposes the request's total timeout to the middleware
+    order. Cancellation is the one exception: a slot handed back by
+    :meth:`RateLimiter.release` frees capacity that queued callers have
+    already been given fixed delays against, so two of them can briefly
+    send in the same instant. When aiohttp exposes the request's timeout
     (aiohttp 3.15 and newer), a wait that would exceed it fails immediately
     with :exc:`asyncio.TimeoutError` instead of sleeping toward a guaranteed
     timeout.
@@ -174,8 +182,6 @@ class RateLimitMiddleware:
     :raises TypeError: if ``limiter`` is not a :class:`RateLimiter`.
     """
 
-    per_domain: bool
-
     def __init__(
         self,
         limiter: RateLimiter,
@@ -184,12 +190,21 @@ class RateLimitMiddleware:
     ) -> None:
         if not isinstance(limiter, RateLimiter):
             raise TypeError(f"limiter must be a RateLimiter, got {limiter!r}")
-        self.per_domain = per_domain
+        self._per_domain = per_domain
         self._global_limiter: RateLimiter | None = None
         if per_domain:
             self._domain_limiters: dict[str, RateLimiter] = defaultdict(limiter.clone)
         else:
             self._global_limiter = limiter
+
+    @property
+    def per_domain(self) -> bool:
+        """Whether this middleware keeps one limiter per target host.
+
+        Read-only: the limiters are built once in ``__init__``, so flipping
+        this afterwards could not take effect.
+        """
+        return self._per_domain
 
     def _get_limiter(self, request: ClientRequest) -> RateLimiter:
         if self._global_limiter is not None:

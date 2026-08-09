@@ -102,7 +102,10 @@ Rate limiting
    the only method the middleware calls and is already a coroutine. Such an
    implementation takes on ordering between concurrent callers, charging its
    round trip against *timeout*, and returning the slot when the caller goes
-   away.
+   away. ``acquire()`` and ``clone()`` are abstract either way, so it still
+   has to define both to be instantiable; its ``acquire()`` is never called
+   and can simply raise, while ``clone()`` is used for real by
+   ``per_domain=True``.
 
 .. class:: TokenBucket(rate=10.0, burst=10)
 
@@ -128,12 +131,17 @@ Rate limiting
    :param bool per_domain: Keep an independent limiter per target host instead
       of a single global one. Limiters are keyed on the URL host only (port
       and scheme are not distinguished) and are never evicted, so only enable
-      this for a bounded, trusted set of hosts.
+      this for a bounded, trusted set of hosts. Redirects count, so the set of
+      hosts is not entirely under the caller's control. Readable afterwards as
+      the read-only ``per_domain`` attribute.
    :raises TypeError: if ``limiter`` is not a :class:`RateLimiter`.
 
    The middleware waits on the limiter before sending, so the client never
    sends faster than the limiter allows and slots are granted in arrival
-   order. When aiohttp exposes the request's total timeout to the middleware
+   order. Cancellation is the one exception: a slot handed back by
+   ``release()`` frees capacity that queued callers already hold fixed delays
+   against, so two of them can briefly send in the same instant. When aiohttp
+   exposes the request's total timeout to the middleware
    (aiohttp 3.15 and newer), a wait that would exceed it fails immediately
    with :exc:`asyncio.TimeoutError` instead of sleeping toward a guaranteed
    timeout.

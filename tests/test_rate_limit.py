@@ -218,6 +218,22 @@ def test_global_mode_shares_one_limiter() -> None:
     assert limiter_a is limiter_b is middleware._global_limiter
 
 
+@pytest.mark.parametrize("per_domain", (False, True))
+def test_per_domain_is_readable_and_read_only(per_domain: bool) -> None:
+    """``per_domain`` reports the configured mode and cannot be reassigned.
+
+    The limiters are built once in ``__init__``, so a writable attribute
+    would silently do nothing.
+    """
+    middleware = RateLimitMiddleware(
+        TokenBucket(rate=10.0, burst=1), per_domain=per_domain
+    )
+
+    assert middleware.per_domain is per_domain
+    with pytest.raises(AttributeError):
+        middleware.per_domain = not per_domain  # type: ignore[misc]
+
+
 # --- New-design behavior ------------------------------------------------------
 
 
