@@ -140,10 +140,9 @@ Rate limiting
    sends faster than the limiter allows and slots are granted in arrival
    order. Cancellation is the one exception: a slot handed back by
    ``release()`` frees capacity that queued callers already hold fixed delays
-   against, so two of them can briefly send in the same instant. When aiohttp
-   exposes the request's total timeout to the middleware
-   (aiohttp 3.15 and newer), a wait that would exceed it fails immediately
-   with :exc:`asyncio.TimeoutError` instead of sleeping toward a guaranteed
+   against, so two of them can briefly send in the same instant. A wait that
+   would exceed the request's total timeout fails immediately with
+   :exc:`asyncio.TimeoutError` instead of sleeping toward a guaranteed
    timeout.
 
    Middleware order matters: middlewares listed earlier wrap the ones listed

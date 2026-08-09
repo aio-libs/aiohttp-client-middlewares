@@ -45,9 +45,9 @@ Installation
 
    $ pip install aiohttp-client-middlewares
 
-This requires ``aiohttp >= 3.12`` (the first release with the client-middleware
-API and ``DigestAuthMiddleware``) and ``yarl >= 1.17.0``. Both are pulled in
-automatically.
+This requires ``aiohttp >= 3.15`` (for the read-only ``ClientRequest.timeout``
+attribute ``RateLimitMiddleware`` reads each request's budget from) and
+``yarl >= 1.17.0``. Both are pulled in automatically.
 
 Supported Python versions: 3.10, 3.11, 3.12, 3.13 and 3.14.
 
