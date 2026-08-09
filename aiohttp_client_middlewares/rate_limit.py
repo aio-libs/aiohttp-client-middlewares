@@ -15,7 +15,7 @@ import time
 from abc import ABC, abstractmethod
 from collections import defaultdict
 
-from aiohttp import ClientHandlerType, ClientRequest, ClientResponse
+from aiohttp import ClientHandlerType, ClientRequest, ClientResponse, ClientTimeout
 
 
 class RateLimiter(ABC):
@@ -211,6 +211,9 @@ class RateLimitMiddleware:
         # ``ClientRequest.timeout`` is public and read-only since aiohttp
         # 3.15 (aio-libs/aiohttp#13176); older releases have no such
         # attribute at all, so the limiter waits without a budget there.
-        client_timeout = getattr(request, "timeout", None)
+        # The annotation keeps the value type-checked even though the
+        # attribute cannot be resolved statically on 3.12 to 3.14. Dropping
+        # the getattr() is gated on raising the floor to 3.15.
+        client_timeout: ClientTimeout | None = getattr(request, "timeout", None)
         await limiter.wait(None if client_timeout is None else client_timeout.total)
         return await handler(request)
