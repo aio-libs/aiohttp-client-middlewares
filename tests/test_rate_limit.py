@@ -438,3 +438,19 @@ def test_rate_limiter_requires_wait_and_clone() -> None:
     message = str(exc_info.value)
     assert "wait" in message
     assert "clone" in message
+
+
+def test_clone_keeps_the_callers_type() -> None:
+    """clone() is typed as returning the caller's own type, not the base.
+
+    Holding a limiter as SyncRateLimiter and cloning it has to keep
+    acquire() and release() reachable, or the migration guidance in the
+    changelog would not type-check.
+    """
+    limiter: SyncRateLimiter = TokenBucket(rate=10.0, burst=1)
+    fresh = limiter.clone()
+
+    assert isinstance(fresh, TokenBucket)
+    assert fresh is not limiter
+    assert fresh.acquire() == 0.0  # a fresh bucket, not the drained one
+    fresh.release()

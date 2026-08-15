@@ -14,8 +14,12 @@ import math
 import time
 from abc import ABC, abstractmethod
 from collections import defaultdict
+from typing import TypeVar
 
 from aiohttp import ClientHandlerType, ClientRequest, ClientResponse, ClientTimeout
+
+# clone() returns a limiter of the caller's own type, so narrowing survives it.
+_LimiterT = TypeVar("_LimiterT", bound="RateLimiter")
 
 
 class RateLimiter(ABC):
@@ -67,8 +71,8 @@ class RateLimiter(ABC):
         """
 
     @abstractmethod
-    def clone(self) -> "RateLimiter":
-        """Return a fresh limiter with the same configuration.
+    def clone(self: _LimiterT) -> _LimiterT:
+        """Return a fresh limiter of this type with the same configuration.
 
         Per-domain mode clones the configured limiter once per target
         host, so state (queued slots, accrued tokens) must not carry over.
