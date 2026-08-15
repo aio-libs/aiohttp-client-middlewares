@@ -96,12 +96,14 @@ Rate limiting
            def __init__(self, redis, key):
                self._redis, self._key = redis, key
 
+           async def _reserve(self):
+               while not await self._redis.set(
+                   self._key, "1", nx=True, ex=1
+               ):
+                   await asyncio.sleep(0.05)
+
            async def wait(self, timeout=None):
-               async with asyncio.timeout(timeout):
-                   while not await self._redis.set(
-                       self._key, "1", nx=True, ex=1
-                   ):
-                       await asyncio.sleep(0.05)
+               await asyncio.wait_for(self._reserve(), timeout)
 
            def clone(self):
                return RedisLimiter(self._redis, self._key)
