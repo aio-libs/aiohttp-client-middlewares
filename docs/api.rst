@@ -86,11 +86,12 @@ Rate limiting
    :class:`RateLimitMiddleware` accepts. Implementations provide the async
    ``wait(timeout=None)``, which reserves a slot and returns once the request
    may be sent -- raising :exc:`asyncio.TimeoutError` rather than waiting past
-   *timeout* -- and ``clone()``, which returns a fresh limiter with the same
+   *timeout*, which is ``None`` to wait as long as it takes -- and ``clone()``,
+   which returns a fresh limiter with the same
    configuration (used once per host by per-domain mode).
 
    Subclass this one when reserving a slot needs I/O of its own, against Redis
-   or a database say, since ``wait()`` is already a coroutine::
+   or a database say, by implementing ``wait()`` as a coroutine::
 
        class RedisLimiter(RateLimiter):
            def __init__(self, redis, key):
@@ -103,15 +104,22 @@ Rate limiting
                    await asyncio.sleep(0.05)
 
            async def wait(self, timeout=None):
-               await asyncio.wait_for(self._reserve(), timeout)
+               try:
+                   await asyncio.wait_for(self._reserve(), timeout)
+               except (asyncio.TimeoutError, asyncio.CancelledError):
+                   # Hand the slot back rather than let it idle out.
+                   await self._redis.delete(self._key)
+                   raise
 
            def clone(self):
                return RedisLimiter(self._redis, self._key)
 
-   Such an implementation owns everything it touches: ordering between
-   concurrent callers, charging its round trip against *timeout*, and handing
-   the slot back when the caller goes away. For an algorithm that can reserve
-   a slot without awaiting, subclass :class:`SyncRateLimiter` instead.
+   That sketch charges its round trips against *timeout* and hands the slot
+   back when the caller goes away, but it grants no particular order between
+   concurrent callers: whichever one happens to poll next wins. Ordering is
+   the implementation's to provide if it needs it, along with anything else
+   :class:`SyncRateLimiter` would otherwise supply. For an algorithm that can
+   reserve a slot without awaiting, subclass :class:`SyncRateLimiter` instead.
 
 .. class:: SyncRateLimiter()
 
@@ -162,10 +170,13 @@ Rate limiting
    :raises TypeError: if ``limiter`` is not a :class:`RateLimiter`.
 
    The middleware waits on the limiter before sending, so the client never
-   sends faster than the limiter allows and slots are granted in arrival
-   order. Cancellation is the one exception: a slot handed back by
-   ``release()`` frees capacity that queued callers already hold fixed delays
-   against, so two of them can briefly send in the same instant. When aiohttp
+   sends faster than the limiter allows. What that ordering is worth is the
+   limiter's to say: a :class:`SyncRateLimiter` grants slots in arrival order,
+   while a :class:`RateLimiter` implementing ``wait()`` itself orders callers
+   however it chooses. Under a :class:`SyncRateLimiter`, cancellation is the
+   one exception: a slot handed back by ``release()`` frees capacity that
+   queued callers already hold fixed delays against, so two of them can
+   briefly send in the same instant. When aiohttp
    exposes the request's total timeout to the middleware
    (aiohttp 3.15 and newer), a wait that would exceed it fails immediately
    with :exc:`asyncio.TimeoutError` instead of sleeping toward a guaranteed

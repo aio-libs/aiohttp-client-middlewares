@@ -21,9 +21,10 @@ from aiohttp import ClientHandlerType, ClientRequest, ClientResponse, ClientTime
 class RateLimiter(ABC):
     """Base class for rate-limit algorithms.
 
-    :meth:`wait` is the only method the middleware calls. Reserving a slot
-    that needs I/O of its own -- against Redis or a database, say -- is a
-    matter of implementing it as a coroutine::
+    :meth:`wait` is the method the middleware throttles with; per-domain
+    mode also calls :meth:`clone` once per new host. Reserving a slot that
+    needs I/O of its own -- against Redis or a database, say -- is a matter
+    of implementing :meth:`wait` as a coroutine::
 
         class RedisLimiter(RateLimiter):
             def __init__(self, redis, key):
@@ -36,14 +37,21 @@ class RateLimiter(ABC):
                     await asyncio.sleep(0.05)
 
             async def wait(self, timeout=None):
-                await asyncio.wait_for(self._reserve(), timeout)
+                try:
+                    await asyncio.wait_for(self._reserve(), timeout)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    # Hand the slot back rather than let it idle out.
+                    await self._redis.delete(self._key)
+                    raise
 
             def clone(self):
                 return RedisLimiter(self._redis, self._key)
 
-    Such an implementation owns everything it touches: ordering between
-    concurrent callers, charging its round trip against *timeout*, and
-    handing the slot back when the caller goes away.
+    That sketch charges its round trips against *timeout* and hands the
+    slot back when the caller goes away, but it grants no particular order
+    between concurrent callers: whichever one happens to poll next wins.
+    Ordering is the implementation's to provide if it needs it, along with
+    anything else :class:`SyncRateLimiter` would otherwise supply.
 
     Algorithms that can reserve a slot without awaiting should subclass
     :class:`SyncRateLimiter` instead, which supplies :meth:`wait` for them.
@@ -54,7 +62,8 @@ class RateLimiter(ABC):
         """Reserve a slot and wait until the request may be sent.
 
         Raise :exc:`asyncio.TimeoutError` if the slot could not be had
-        within *timeout*, rather than waiting past it.
+        within *timeout*, rather than waiting past it. A *timeout* of
+        ``None`` means wait as long as it takes.
         """
 
     @abstractmethod
@@ -179,14 +188,18 @@ class RateLimitMiddleware:
     """Client middleware that throttles requests through a :class:`RateLimiter`.
 
     The middleware waits on the limiter before sending, so the client never
-    sends faster than the limiter allows and slots are granted in arrival
-    order. Cancellation is the one exception: a slot handed back by
-    :meth:`RateLimiter.release` frees capacity that queued callers have
-    already been given fixed delays against, so two of them can briefly
-    send in the same instant. When aiohttp exposes the request's timeout
-    (aiohttp 3.15 and newer), a wait that would exceed it fails immediately
-    with :exc:`asyncio.TimeoutError` instead of sleeping toward a guaranteed
-    timeout.
+    sends faster than the limiter allows. What that ordering is worth is the
+    limiter's to say: a :class:`SyncRateLimiter` grants slots in arrival
+    order, while a :class:`RateLimiter` implementing :meth:`~RateLimiter.wait`
+    itself orders callers however it chooses.
+
+    Under a :class:`SyncRateLimiter`, cancellation is the one exception to
+    arrival order: a slot handed back by :meth:`SyncRateLimiter.release`
+    frees capacity that queued callers have already been given fixed delays
+    against, so two of them can briefly send in the same instant. And when
+    aiohttp exposes the request's timeout (aiohttp 3.15 and newer), a wait
+    that would exceed it fails immediately with :exc:`asyncio.TimeoutError`
+    instead of sleeping toward a guaranteed timeout.
 
     Middleware order matters: middlewares listed earlier wrap the ones listed
     later, and a middleware that retries internally (for example,
