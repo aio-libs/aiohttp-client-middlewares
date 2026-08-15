@@ -13,6 +13,7 @@ from yarl import URL
 from aiohttp_client_middlewares.rate_limit import (
     RateLimiter,
     RateLimitMiddleware,
+    SyncRateLimiter,
     TokenBucket,
 )
 
@@ -267,7 +268,7 @@ async def test_middleware_bails_before_sleeping_when_timeout_known() -> None:
         raise AssertionError("a doomed request must never be sent")
 
     bucket = middleware._global_limiter
-    assert bucket is not None
+    assert isinstance(bucket, TokenBucket)
     assert bucket.acquire() == 0.0  # drain the burst slot
 
     start = time.monotonic()
@@ -287,7 +288,7 @@ async def test_middleware_cancel_during_sleep_releases_slot() -> None:
         raise AssertionError("the cancelled request must never be sent")
 
     bucket = middleware._global_limiter
-    assert bucket is not None
+    assert isinstance(bucket, TokenBucket)
     assert bucket.acquire() == 0.0  # drain the burst slot
 
     task = asyncio.ensure_future(middleware(request, handler))
@@ -333,10 +334,10 @@ def test_token_bucket_needs_no_event_loop() -> None:
     assert bucket.acquire() > 0.0
 
 
-# --- RateLimiter base class ---------------------------------------------------
+# --- SyncRateLimiter base class ---------------------------------------------------
 
 
-class _FixedDelay(RateLimiter):
+class _FixedDelay(SyncRateLimiter):
     """Minimal limiter: fixed delay, inherits the no-op ``release``."""
 
     def __init__(self, delay: float) -> None:
@@ -368,3 +369,66 @@ async def test_rate_limiter_wait_timeout_uses_default_release() -> None:
     """The base timeout bail calls release(); the default no-op suffices."""
     with pytest.raises(asyncio.TimeoutError):
         await _FixedDelay(5.0).wait(timeout=0.1)
+
+
+def test_sync_rate_limiter_still_requires_acquire() -> None:
+    """SyncRateLimiter supplies wait(), so acquire() is what it demands."""
+
+    class _NoAcquire(SyncRateLimiter):
+        def clone(self) -> "_NoAcquire":
+            raise NotImplementedError
+
+    with pytest.raises(TypeError, match="acquire"):
+        _NoAcquire()  # type: ignore[abstract]
+
+
+# --- RateLimiter base class ---------------------------------------------------
+
+
+class _AwaitsToReserve(RateLimiter):
+    """A limiter whose slot reservation awaits, as an I/O-backed one would."""
+
+    def __init__(self) -> None:
+        self.waited: list[float | None] = []
+
+    async def wait(self, timeout: float | None = None) -> None:
+        self.waited.append(timeout)
+        await asyncio.sleep(0)
+
+    def clone(self) -> "_AwaitsToReserve":
+        return _AwaitsToReserve()
+
+
+def test_rate_limiter_needs_no_acquire() -> None:
+    """Implementing wait() is enough; there is no acquire() to stub out."""
+    limiter = _AwaitsToReserve()
+
+    assert not hasattr(limiter, "acquire")
+    assert not hasattr(limiter, "release")
+
+
+async def test_middleware_drives_an_awaiting_limiter() -> None:
+    """The middleware only calls wait(), so an async limiter works as-is."""
+    limiter = _AwaitsToReserve()
+    middleware = RateLimitMiddleware(limiter)
+    request = _fake_request("example.com", aiohttp.ClientTimeout(total=7.0))
+    sent = []
+
+    async def handler(req: ClientRequest) -> ClientResponse:
+        sent.append(req)
+        return mock.create_autospec(ClientResponse, instance=True)  # type: ignore[no-any-return]
+
+    await middleware(request, handler)
+
+    assert len(sent) == 1
+    assert limiter.waited == [7.0]  # the request timeout was passed through
+
+
+def test_rate_limiter_requires_wait_and_clone() -> None:
+    """Both halves of the base contract are enforced."""
+
+    class _Nothing(RateLimiter):
+        pass
+
+    with pytest.raises(TypeError, match="clone|wait"):
+        _Nothing()  # type: ignore[abstract]

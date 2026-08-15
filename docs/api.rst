@@ -82,34 +82,57 @@ Rate limiting
 
 .. class:: RateLimiter()
 
-   Abstract base class for rate-limit algorithms. Implementations provide the
-   synchronous ``acquire()``, which reserves a slot and returns the delay, in
-   seconds, to sleep before sending, and ``clone()``, which returns a fresh
-   limiter with the same configuration (used once per host by per-domain
-   mode). The async ``wait(timeout=None)`` method is shared by all
-   implementations: it acquires a slot, fails fast with
-   :exc:`asyncio.TimeoutError` -- handing the slot back -- when the delay
-   would exceed *timeout*, sleeps out the delay otherwise, and hands the slot
-   back if the caller is cancelled mid-sleep. ``release()`` defaults to a
-   no-op for algorithms that have nothing to return.
+   Abstract base class for rate-limit algorithms, and the type
+   :class:`RateLimitMiddleware` accepts. Implementations provide the async
+   ``wait(timeout=None)``, which reserves a slot and returns once the request
+   may be sent -- raising :exc:`asyncio.TimeoutError` rather than waiting past
+   *timeout* -- and ``clone()``, which returns a fresh limiter with the same
+   configuration (used once per host by per-domain mode).
+
+   Subclass this one when reserving a slot needs I/O of its own, against Redis
+   or a database say, since ``wait()`` is already a coroutine::
+
+       class RedisLimiter(RateLimiter):
+           def __init__(self, redis, key):
+               self._redis, self._key = redis, key
+
+           async def wait(self, timeout=None):
+               async with asyncio.timeout(timeout):
+                   while not await self._redis.set(
+                       self._key, "1", nx=True, ex=1
+                   ):
+                       await asyncio.sleep(0.05)
+
+           def clone(self):
+               return RedisLimiter(self._redis, self._key)
+
+   Such an implementation owns everything it touches: ordering between
+   concurrent callers, charging its round trip against *timeout*, and handing
+   the slot back when the caller goes away. For an algorithm that can reserve
+   a slot without awaiting, subclass :class:`SyncRateLimiter` instead.
+
+.. class:: SyncRateLimiter()
+
+   A :class:`RateLimiter` for algorithms that reserve a slot without awaiting.
+   Implementations provide the synchronous ``acquire()``, which reserves a
+   slot and returns the delay, in seconds, to sleep before sending, plus
+   ``clone()``; ``release()`` defaults to a no-op for algorithms that have
+   nothing to return.
+
+   ``wait()`` is supplied here and shared by every such algorithm: it acquires
+   a slot, fails fast with :exc:`asyncio.TimeoutError` -- handing the slot
+   back -- when the delay would exceed *timeout*, sleeps out the delay
+   otherwise, and hands the slot back if the caller is cancelled mid-sleep.
 
    Neither ``acquire()`` nor ``release()`` may await. Their being synchronous
    is what reserves slots atomically, in arrival order, across concurrent
    callers on one event loop, and ``release()`` additionally runs from a
-   cancellation handler, where an awaiting implementation can be truncated
-   and lose the slot. A limiter that needs I/O to reserve a slot -- one
-   backed by Redis or a database, say -- overrides ``wait()`` instead: it is
-   the only method the middleware calls and is already a coroutine. Such an
-   implementation takes on ordering between concurrent callers, charging its
-   round trip against *timeout*, and returning the slot when the caller goes
-   away. ``acquire()`` and ``clone()`` are abstract either way, so it still
-   has to define both to be instantiable; its ``acquire()`` is never called
-   and can simply raise, while ``clone()`` is used for real by
-   ``per_domain=True``.
+   cancellation handler, where an awaiting implementation can be truncated and
+   lose the slot.
 
 .. class:: TokenBucket(rate=10.0, burst=10)
 
-   A :class:`RateLimiter`: tokens accrue continuously at ``rate`` per second,
+   A :class:`SyncRateLimiter`: tokens accrue continuously at ``rate`` per second,
    capped at ``burst``; ``acquire()`` takes one token and the count may go
    negative, which is what queues callers up in arrival order. The bucket
    holds no tasks or loop state.

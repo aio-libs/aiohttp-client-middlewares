@@ -1,0 +1,7 @@
+Split :class:`~aiohttp_client_middlewares.RateLimiter` in two. It now declares
+only the async ``wait()`` and ``clone()``, so a limiter that reserves its slot
+over the network implements ``wait()`` and nothing else. Algorithms that reserve
+without awaiting subclass the new
+:class:`~aiohttp_client_middlewares.SyncRateLimiter`, which supplies ``wait()``
+and asks for ``acquire()`` instead -- :class:`~aiohttp_client_middlewares.TokenBucket`
+is one of these -- by :user:`rodrigobnogueira`.

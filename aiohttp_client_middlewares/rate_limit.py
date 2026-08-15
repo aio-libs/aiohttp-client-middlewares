@@ -21,31 +21,38 @@ from aiohttp import ClientHandlerType, ClientRequest, ClientResponse, ClientTime
 class RateLimiter(ABC):
     """Base class for rate-limit algorithms.
 
-    Implementations provide the synchronous :meth:`acquire` and
-    :meth:`clone`; the async sleeping and timeout logic live here in
-    :meth:`wait`, shared by every algorithm. Because :meth:`acquire` is
-    synchronous, callers on one event loop reserve slots atomically in
-    arrival order.
+    :meth:`wait` is the only method the middleware calls. Reserving a slot
+    that needs I/O of its own -- against Redis or a database, say -- is a
+    matter of implementing it as a coroutine::
 
-    A limiter that needs I/O to reserve a slot -- one backed by Redis or a
-    database, say -- overrides :meth:`wait` rather than :meth:`acquire`:
-    ``wait`` is the only method the middleware calls and is already a
-    coroutine. Such an implementation owns what it takes over: ordering
-    between concurrent callers, charging the round trip against *timeout*,
-    and handing the slot back when the caller goes away.
+        class RedisLimiter(RateLimiter):
+            def __init__(self, redis, key):
+                self._redis, self._key = redis, key
 
-    :meth:`acquire` and :meth:`clone` stay abstract either way, so an
-    implementation that overrides :meth:`wait` still has to define both to
-    be instantiable. Its :meth:`acquire` is never called and can simply
-    raise; :meth:`clone` is called for real by ``per_domain=True``.
+            async def wait(self, timeout=None):
+                async with asyncio.timeout(timeout):
+                    while not await self._redis.set(
+                        self._key, "1", nx=True, ex=1
+                    ):
+                        await asyncio.sleep(0.05)
+
+            def clone(self):
+                return RedisLimiter(self._redis, self._key)
+
+    Such an implementation owns everything it touches: ordering between
+    concurrent callers, charging its round trip against *timeout*, and
+    handing the slot back when the caller goes away.
+
+    Algorithms that can reserve a slot without awaiting should subclass
+    :class:`SyncRateLimiter` instead, which supplies :meth:`wait` for them.
     """
 
     @abstractmethod
-    def acquire(self) -> float:
-        """Reserve a slot and return the delay to sleep before sending.
+    async def wait(self, timeout: float | None = None) -> None:
+        """Reserve a slot and wait until the request may be sent.
 
-        Must return without awaiting: the arrival-order guarantee above
-        holds precisely because there is no suspension point here.
+        Raise :exc:`asyncio.TimeoutError` if the slot could not be had
+        within *timeout*, rather than waiting past it.
         """
 
     @abstractmethod
@@ -54,6 +61,24 @@ class RateLimiter(ABC):
 
         Per-domain mode clones the configured limiter once per target
         host, so state (queued slots, accrued tokens) must not carry over.
+        """
+
+
+class SyncRateLimiter(RateLimiter):
+    """Base class for algorithms that reserve a slot without awaiting.
+
+    Implementations provide :meth:`acquire` and :meth:`clone`, and may
+    override :meth:`release`; the sleeping and timeout logic lives here in
+    :meth:`wait`. Because :meth:`acquire` does not await, callers on one
+    event loop reserve slots atomically, in arrival order.
+    """
+
+    @abstractmethod
+    def acquire(self) -> float:
+        """Reserve a slot and return the delay to sleep before sending.
+
+        Must return without awaiting: the arrival-order guarantee above
+        holds precisely because there is no suspension point here.
         """
 
     def release(self) -> None:
@@ -75,9 +100,6 @@ class RateLimiter(ABC):
         When the delay would exceed *timeout*, the slot is handed back and
         :exc:`asyncio.TimeoutError` is raised without sleeping, so a
         request that could never be sent in time fails fast.
-
-        This is the method the middleware calls, and the one to override
-        when reserving a slot needs I/O of its own.
         """
         delay = self.acquire()
         if timeout is not None and delay > timeout:
@@ -96,7 +118,7 @@ class RateLimiter(ABC):
                 raise
 
 
-class TokenBucket(RateLimiter):
+class TokenBucket(SyncRateLimiter):
     """Token bucket: tokens accrue at ``rate`` per second, capped at ``burst``.
 
     ``acquire`` takes one token immediately and returns the delay the caller
