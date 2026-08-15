@@ -54,8 +54,8 @@ class RateLimiter(ABC):
     whichever polls next wins, and its clones share one key, so under
     ``per_domain=True`` every host draws on the same limit. Ordering,
     prompt hand-back and per-host keys are the implementation's to provide
-    if it needs them, along with anything else :class:`SyncRateLimiter`
-    would otherwise supply.
+    if it needs them; :class:`SyncRateLimiter` is where arrival ordering
+    and a :meth:`~SyncRateLimiter.release` hook come from otherwise.
 
     Algorithms that can reserve a slot without awaiting should subclass
     :class:`SyncRateLimiter` instead, which supplies :meth:`wait` for them.

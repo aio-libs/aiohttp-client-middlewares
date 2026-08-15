@@ -116,8 +116,10 @@ Rate limiting
    expiry. Nor does the sketch order concurrent callers, whichever polls next
    wins, and its clones share one key, so under ``per_domain=True`` every host
    draws on the same limit. Ordering, prompt hand-back and per-host keys are
-   the implementation's to provide if it needs them. For an algorithm that can
-   reserve a slot without awaiting, subclass :class:`SyncRateLimiter` instead.
+   the implementation's to provide if it needs them; :class:`SyncRateLimiter`
+   is where arrival ordering and a ``release()`` hook come from otherwise. For
+   an algorithm that can reserve a slot without awaiting, subclass
+   :class:`SyncRateLimiter` instead.
 
 .. class:: SyncRateLimiter()
 
