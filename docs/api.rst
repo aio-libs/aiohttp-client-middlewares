@@ -104,21 +104,19 @@ Rate limiting
                    await asyncio.sleep(0.05)
 
            async def wait(self, timeout=None):
-               try:
-                   await asyncio.wait_for(self._reserve(), timeout)
-               except (asyncio.TimeoutError, asyncio.CancelledError):
-                   # Hand the slot back rather than let it idle out.
-                   await self._redis.delete(self._key)
-                   raise
+               await asyncio.wait_for(self._reserve(), timeout)
 
            def clone(self):
                return RedisLimiter(self._redis, self._key)
 
-   That sketch charges its round trips against *timeout* and hands the slot
-   back when the caller goes away, but it grants no particular order between
-   concurrent callers: whichever one happens to poll next wins. Ordering is
-   the implementation's to provide if it needs it, along with anything else
-   :class:`SyncRateLimiter` would otherwise supply. For an algorithm that can
+   That sketch charges its round trips against *timeout*, and no further. A
+   caller that gives up is almost always still polling, so it holds nothing to
+   hand back and must not delete the key -- that would release whoever does
+   hold it. An abandoned reservation instead idles out with the key's own
+   expiry. Nor does the sketch order concurrent callers, whichever polls next
+   wins, and its clones share one key, so under ``per_domain=True`` every host
+   draws on the same limit. Ordering, prompt hand-back and per-host keys are
+   the implementation's to provide if it needs them. For an algorithm that can
    reserve a slot without awaiting, subclass :class:`SyncRateLimiter` instead.
 
 .. class:: SyncRateLimiter()

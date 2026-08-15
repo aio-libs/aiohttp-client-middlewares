@@ -430,5 +430,11 @@ def test_rate_limiter_requires_wait_and_clone() -> None:
     class _Nothing(RateLimiter):
         pass
 
-    with pytest.raises(TypeError, match="clone|wait"):
+    with pytest.raises(TypeError) as exc_info:
         _Nothing()  # type: ignore[abstract]
+
+    # Either name alone would pass a loose match, and wait() ceasing to be
+    # abstract is exactly the regression this guards.
+    message = str(exc_info.value)
+    assert "wait" in message
+    assert "clone" in message
