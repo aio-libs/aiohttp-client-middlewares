@@ -1,21 +1,17 @@
-Split :class:`~aiohttp_client_middlewares.RateLimiter` in two, so that neither
-half has to describe a contract it does not keep.
+Made :meth:`~aiohttp_client_middlewares.RateLimiter.acquire` async so rate
+limiters may reserve slots through Redis, a database, or another I/O-backed
+service without replacing the shared wait logic.
 
-:class:`~aiohttp_client_middlewares.RateLimiter` now declares the async
-``wait()`` and ``clone()``. A limiter that reserves its slot over the network
-implements those two and is done; it no longer has to stub out an ``acquire()``
-that is never called.
+:class:`~aiohttp_client_middlewares.RateLimiter` continues to supply
+``wait()``, which now charges acquisition time against the timeout before
+sleeping out the returned delay. It also continues to own timeout and
+post-reservation cancellation cleanup through ``release()``. An ``acquire()``
+implementation is responsible for leaving no reservation behind if it is
+cancelled or raises before returning.
 
-Algorithms that reserve a slot without awaiting subclass the new
-:class:`~aiohttp_client_middlewares.SyncRateLimiter`, which supplies ``wait()``
-and asks for ``acquire()`` instead. ``release()`` moved there with it, and so
-did the guarantee that slots are granted in arrival order, which only ever held
-for these. :class:`~aiohttp_client_middlewares.TokenBucket` is one of them and
-is otherwise unchanged.
-
-To upgrade, a limiter that implements ``acquire()`` changes its base class to
-``SyncRateLimiter``; leaving it on ``RateLimiter`` now raises ``TypeError`` at
-instantiation, for the abstract ``wait()`` it does not define. Code that calls
-or overrides ``release()`` through a ``RateLimiter``-typed reference needs the
-narrower type. ``RateLimitMiddleware`` accepts either and is unaffected
+To upgrade, change a synchronous ``def acquire(self)`` implementation to
+``async def acquire(self)`` and await any direct calls to it. An implementation
+that needs no I/O can omit ``await`` internally; it then retains atomic
+arrival-order reservation on one event loop, as
+:class:`~aiohttp_client_middlewares.TokenBucket` does
 -- by :user:`rodrigobnogueira`.

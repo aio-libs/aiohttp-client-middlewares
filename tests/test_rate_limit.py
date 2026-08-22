@@ -13,7 +13,6 @@ from yarl import URL
 from aiohttp_client_middlewares.rate_limit import (
     RateLimiter,
     RateLimitMiddleware,
-    SyncRateLimiter,
     TokenBucket,
 )
 
@@ -51,7 +50,7 @@ async def _cancel_and_join(task: "asyncio.Future[None]") -> None:
 
 
 class _FakeClock:
-    """A controllable stand-in for ``time.monotonic`` (sync tests only)."""
+    """A controllable stand-in for ``time.monotonic``."""
 
     def __init__(self) -> None:
         self.now = 1000.0
@@ -70,73 +69,73 @@ def clock(monkeypatch: pytest.MonkeyPatch) -> _FakeClock:
     return fake
 
 
-def test_token_bucket_burst_is_instant(clock: _FakeClock) -> None:
+async def test_token_bucket_burst_is_instant(clock: _FakeClock) -> None:
     """The first ``burst`` acquires owe no delay; the next one throttles."""
     bucket = TokenBucket(rate=10.0, burst=3)
-    assert [bucket.acquire() for _ in range(3)] == [0.0, 0.0, 0.0]
-    assert bucket.acquire() == pytest.approx(0.1)
+    assert [await bucket.acquire() for _ in range(3)] == [0.0, 0.0, 0.0]
+    assert await bucket.acquire() == pytest.approx(0.1)
 
 
-def test_token_bucket_exact_fractional_delays(clock: _FakeClock) -> None:
+async def test_token_bucket_exact_fractional_delays(clock: _FakeClock) -> None:
     """Delays are the exact deficit, not rounded up to whole intervals."""
     bucket = TokenBucket(rate=10.0, burst=1)
-    assert bucket.acquire() == 0.0
-    assert bucket.acquire() == pytest.approx(0.1)
+    assert await bucket.acquire() == 0.0
+    assert await bucket.acquire() == pytest.approx(0.1)
     clock.advance(0.05)  # half a token accrues
-    assert bucket.acquire() == pytest.approx(0.15)
+    assert await bucket.acquire() == pytest.approx(0.15)
 
 
-def test_token_bucket_queues_in_arrival_order(clock: _FakeClock) -> None:
+async def test_token_bucket_queues_in_arrival_order(clock: _FakeClock) -> None:
     """Consecutive over-limit acquires owe strictly increasing delays."""
     bucket = TokenBucket(rate=10.0, burst=1)
-    delays = [bucket.acquire() for _ in range(4)]
+    delays = await asyncio.gather(*(bucket.acquire() for _ in range(4)))
     assert delays == [0.0, pytest.approx(0.1), pytest.approx(0.2), pytest.approx(0.3)]
 
 
-def test_token_bucket_refills_after_idle(clock: _FakeClock) -> None:
+async def test_token_bucket_refills_after_idle(clock: _FakeClock) -> None:
     """Idle time replenishes tokens, capped at ``burst``."""
     bucket = TokenBucket(rate=10.0, burst=2)
-    bucket.acquire()
-    bucket.acquire()  # drained
+    await bucket.acquire()
+    await bucket.acquire()  # drained
     clock.advance(10.0)  # far more than burst * interval
-    assert bucket.acquire() == 0.0
-    assert bucket.acquire() == 0.0  # exactly *burst* free slots accrued
-    assert bucket.acquire() == pytest.approx(0.1)  # the cap held
+    assert await bucket.acquire() == 0.0
+    assert await bucket.acquire() == 0.0  # exactly *burst* free slots accrued
+    assert await bucket.acquire() == pytest.approx(0.1)  # the cap held
 
 
 async def test_wait_timeout_bail_returns_slot(clock: _FakeClock) -> None:
     """A doomed wait raises TimeoutError without consuming a slot."""
     bucket = TokenBucket(rate=10.0, burst=1)
-    bucket.acquire()
+    await bucket.acquire()
     with pytest.raises(asyncio.TimeoutError):
         await bucket.wait(timeout=0.05)  # would need 0.1s
     # The failed wait handed its token back: the next caller owes one
     # interval, not two.
-    assert bucket.acquire() == pytest.approx(0.1)
+    assert await bucket.acquire() == pytest.approx(0.1)
 
 
 async def test_wait_within_timeout_sleeps_out_the_delay() -> None:
     """A delay inside the timeout budget is granted normally."""
     bucket = TokenBucket(rate=1000.0, burst=1)
-    bucket.acquire()
+    await bucket.acquire()
     await bucket.wait(timeout=1.0)  # ~1ms delay, well within budget
 
 
-def test_token_bucket_release_returns_token(clock: _FakeClock) -> None:
+async def test_token_bucket_release_returns_token(clock: _FakeClock) -> None:
     """``release`` gives an unused slot back to the pool."""
     bucket = TokenBucket(rate=10.0, burst=1)
-    bucket.acquire()
-    bucket.acquire()  # goes into debt
+    await bucket.acquire()
+    await bucket.acquire()  # goes into debt
     bucket.release()
-    assert bucket.acquire() == pytest.approx(0.1)  # debt was cancelled
+    assert await bucket.acquire() == pytest.approx(0.1)  # debt was cancelled
 
 
-def test_token_bucket_release_caps_at_burst(clock: _FakeClock) -> None:
+async def test_token_bucket_release_caps_at_burst(clock: _FakeClock) -> None:
     """``release`` never grows the bucket beyond ``burst``."""
     bucket = TokenBucket(rate=10.0, burst=1)
     bucket.release()  # already full
-    assert bucket.acquire() == 0.0
-    assert bucket.acquire() == pytest.approx(0.1)  # only one free slot existed
+    assert await bucket.acquire() == 0.0
+    assert await bucket.acquire() == pytest.approx(0.1)  # only one free slot existed
 
 
 async def test_rate_limit_middleware_throttles(aiohttp_client: AiohttpClient) -> None:
@@ -269,14 +268,14 @@ async def test_middleware_bails_before_sleeping_when_timeout_known() -> None:
 
     bucket = middleware._global_limiter
     assert isinstance(bucket, TokenBucket)
-    assert bucket.acquire() == 0.0  # drain the burst slot
+    assert await bucket.acquire() == 0.0  # drain the burst slot
 
     start = time.monotonic()
     with pytest.raises(asyncio.TimeoutError):
         await middleware(request, handler)
     assert time.monotonic() - start < 0.5  # bailed, did not sleep ~1s
     # The doomed request handed its token back.
-    assert bucket.acquire() <= 1.0
+    assert await bucket.acquire() <= 1.0
 
 
 async def test_middleware_cancel_during_sleep_releases_slot() -> None:
@@ -289,7 +288,7 @@ async def test_middleware_cancel_during_sleep_releases_slot() -> None:
 
     bucket = middleware._global_limiter
     assert isinstance(bucket, TokenBucket)
-    assert bucket.acquire() == 0.0  # drain the burst slot
+    assert await bucket.acquire() == 0.0  # drain the burst slot
 
     task = asyncio.ensure_future(middleware(request, handler))
     await asyncio.sleep(0.05)  # the middleware is now sleeping out its delay
@@ -298,7 +297,7 @@ async def test_middleware_cancel_during_sleep_releases_slot() -> None:
     assert task.cancelled()
 
     # The slot went back: the next caller owes at most one interval, not two.
-    assert bucket.acquire() <= 0.2
+    assert await bucket.acquire() <= 0.2
 
 
 def test_limiter_injection_is_used_directly() -> None:
@@ -314,36 +313,36 @@ def test_non_limiter_rejected() -> None:
         RateLimitMiddleware(lambda: TokenBucket(rate=1.0, burst=1))  # type: ignore[arg-type]
 
 
-def test_token_bucket_clone_is_fresh(clock: _FakeClock) -> None:
+async def test_token_bucket_clone_is_fresh(clock: _FakeClock) -> None:
     """``clone`` copies the configuration, never the drained state."""
     template = TokenBucket(rate=10.0, burst=2)
-    template.acquire()
-    template.acquire()
-    assert template.acquire() > 0.0  # template drained into debt
+    await template.acquire()
+    await template.acquire()
+    assert await template.acquire() > 0.0  # template drained into debt
 
     fresh = template.clone()
-    assert fresh.acquire() == 0.0  # full burst again
-    assert fresh.acquire() == 0.0
-    assert fresh.acquire() == pytest.approx(0.1)  # same rate as the template
+    assert await fresh.acquire() == 0.0  # full burst again
+    assert await fresh.acquire() == 0.0
+    assert await fresh.acquire() == pytest.approx(0.1)  # same rate as the template
 
 
 def test_token_bucket_needs_no_event_loop() -> None:
-    """The bucket holds no loop state and works without a running loop."""
+    """The bucket holds no loop state and works across sequential loops."""
     bucket = TokenBucket(rate=1000.0, burst=1)
-    assert bucket.acquire() == 0.0
-    assert bucket.acquire() > 0.0
+    assert asyncio.run(bucket.acquire()) == 0.0
+    assert asyncio.run(bucket.acquire()) > 0.0
 
 
-# --- SyncRateLimiter base class ---------------------------------------------------
+# --- RateLimiter base class ---------------------------------------------------
 
 
-class _FixedDelay(SyncRateLimiter):
+class _FixedDelay(RateLimiter):
     """Minimal limiter: fixed delay, inherits the no-op ``release``."""
 
     def __init__(self, delay: float) -> None:
         self._delay = delay
 
-    def acquire(self) -> float:
+    async def acquire(self) -> float:
         return self._delay
 
     def clone(self) -> "_FixedDelay":
@@ -371,44 +370,37 @@ async def test_rate_limiter_wait_timeout_uses_default_release() -> None:
         await _FixedDelay(5.0).wait(timeout=0.1)
 
 
-def test_sync_rate_limiter_still_requires_acquire() -> None:
-    """SyncRateLimiter supplies wait(), so acquire() is what it demands."""
+def test_rate_limiter_requires_acquire_and_clone() -> None:
+    """RateLimiter supplies wait(), so acquire() and clone() are abstract."""
 
-    class _NoAcquire(SyncRateLimiter):
-        def clone(self) -> "_NoAcquire":
-            raise NotImplementedError
+    class _Nothing(RateLimiter):
+        pass
 
-    with pytest.raises(TypeError, match="acquire"):
-        _NoAcquire()  # type: ignore[abstract]
+    with pytest.raises(TypeError) as exc_info:
+        _Nothing()  # type: ignore[abstract]
 
-
-# --- RateLimiter base class ---------------------------------------------------
+    message = str(exc_info.value)
+    assert "acquire" in message
+    assert "clone" in message
 
 
 class _AwaitsToReserve(RateLimiter):
     """A limiter whose slot reservation awaits, as an I/O-backed one would."""
 
     def __init__(self) -> None:
-        self.waited: list[float | None] = []
+        self.acquires = 0
 
-    async def wait(self, timeout: float | None = None) -> None:
-        self.waited.append(timeout)
+    async def acquire(self) -> float:
+        self.acquires += 1
         await asyncio.sleep(0)
+        return 0.0
 
     def clone(self) -> "_AwaitsToReserve":
         return _AwaitsToReserve()
 
 
-def test_rate_limiter_needs_no_acquire() -> None:
-    """Implementing wait() is enough; there is no acquire() to stub out."""
-    limiter = _AwaitsToReserve()
-
-    assert not hasattr(limiter, "acquire")
-    assert not hasattr(limiter, "release")
-
-
 async def test_middleware_drives_an_awaiting_limiter() -> None:
-    """The middleware only calls wait(), so an async limiter works as-is."""
+    """The shared wait method drives an I/O-backed acquire implementation."""
     limiter = _AwaitsToReserve()
     middleware = RateLimitMiddleware(limiter)
     request = _fake_request("example.com", aiohttp.ClientTimeout(total=7.0))
@@ -421,36 +413,81 @@ async def test_middleware_drives_an_awaiting_limiter() -> None:
     await middleware(request, handler)
 
     assert len(sent) == 1
-    assert limiter.waited == [7.0]  # the request timeout was passed through
+    assert limiter.acquires == 1
 
 
-def test_rate_limiter_requires_wait_and_clone() -> None:
-    """Both halves of the base contract are enforced."""
+class _ElapsedAcquire(RateLimiter):
+    """Limiter that advances a fake clock while reserving a slot."""
 
-    class _Nothing(RateLimiter):
-        pass
+    def __init__(self, clock: _FakeClock) -> None:
+        self._clock = clock
+        self.releases = 0
 
-    with pytest.raises(TypeError) as exc_info:
-        _Nothing()  # type: ignore[abstract]
+    async def acquire(self) -> float:
+        self._clock.advance(0.075)
+        return 0.05
 
-    # Either name alone would pass a loose match, and wait() ceasing to be
-    # abstract is exactly the regression this guards.
-    message = str(exc_info.value)
-    assert "wait" in message
-    assert "clone" in message
+    def release(self) -> None:
+        self.releases += 1
+
+    def clone(self) -> "_ElapsedAcquire":
+        return _ElapsedAcquire(self._clock)
 
 
-def test_clone_keeps_the_callers_type() -> None:
+async def test_acquisition_time_reduces_remaining_timeout(clock: _FakeClock) -> None:
+    """The delay is checked against the budget left after acquisition."""
+    limiter = _ElapsedAcquire(clock)
+
+    with pytest.raises(asyncio.TimeoutError, match="remaining timeout"):
+        await limiter.wait(timeout=0.1)
+
+    assert limiter.releases == 1
+
+
+class _CancelledAcquire(RateLimiter):
+    """Limiter that records cancellation before it can reserve a slot."""
+
+    def __init__(self) -> None:
+        self.cancelled = False
+        self.releases = 0
+
+    async def acquire(self) -> float:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        raise AssertionError("the event must never be set")
+
+    def release(self) -> None:
+        self.releases += 1
+
+    def clone(self) -> "_CancelledAcquire":
+        return _CancelledAcquire()
+
+
+async def test_acquisition_cancellation_does_not_call_release() -> None:
+    """Cleanup before acquire returns belongs to the acquire implementation."""
+    limiter = _CancelledAcquire()
+    task = asyncio.ensure_future(limiter.wait(timeout=60.0))
+    await asyncio.sleep(0)
+
+    await _cancel_and_join(task)
+
+    assert limiter.cancelled
+    assert limiter.releases == 0
+
+
+async def test_clone_keeps_the_callers_type() -> None:
     """clone() is typed as returning the caller's own type, not the base.
 
-    Holding a limiter as SyncRateLimiter and cloning it has to keep
-    acquire() and release() reachable, or the migration guidance in the
-    changelog would not type-check.
+    Holding a limiter as RateLimiter and cloning it has to keep the concrete
+    return type, so downstream narrowing survives the call.
     """
-    limiter: SyncRateLimiter = TokenBucket(rate=10.0, burst=1)
+    limiter: RateLimiter = TokenBucket(rate=10.0, burst=1)
     fresh = limiter.clone()
 
     assert isinstance(fresh, TokenBucket)
     assert fresh is not limiter
-    assert fresh.acquire() == 0.0  # a fresh bucket, not the drained one
+    assert await fresh.acquire() == 0.0  # a fresh bucket, not the drained one
     fresh.release()

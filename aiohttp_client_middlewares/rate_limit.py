@@ -25,49 +25,27 @@ _LimiterT = TypeVar("_LimiterT", bound="RateLimiter")
 class RateLimiter(ABC):
     """Base class for rate-limit algorithms.
 
-    :meth:`wait` is the method the middleware throttles with; per-domain
-    mode also calls :meth:`clone` once per new host. Reserving a slot that
-    needs I/O of its own -- against Redis or a database, say -- is a matter
-    of implementing :meth:`wait` as a coroutine::
+    Implementations provide the async :meth:`acquire` and :meth:`clone`;
+    the sleeping, timeout and post-reservation cancellation logic lives in
+    :meth:`wait`, shared by every algorithm. Reserving a slot may therefore
+    perform I/O of its own -- against Redis or a database, say.
 
-        class RedisLimiter(RateLimiter):
-            def __init__(self, redis, key):
-                self._redis, self._key = redis, key
+    An :meth:`acquire` implementation must be cancellation-safe. If it is
+    cancelled or raises before returning, it is responsible for ensuring
+    that no reservation is left behind. Once it returns, :meth:`wait` owns
+    the reservation and calls :meth:`release` if the slot cannot be used.
 
-            async def _reserve(self):
-                while not await self._redis.set(
-                    self._key, "1", nx=True, ex=1
-                ):
-                    await asyncio.sleep(0.05)
-
-            async def wait(self, timeout=None):
-                await asyncio.wait_for(self._reserve(), timeout)
-
-            def clone(self):
-                return RedisLimiter(self._redis, self._key)
-
-    That sketch charges its round trips against *timeout*, and no further.
-    A caller that gives up is almost always still polling, so it holds
-    nothing to hand back and must not delete the key -- that would release
-    whoever does hold it. An abandoned reservation instead idles out with
-    the key's own expiry. Nor does the sketch order concurrent callers,
-    whichever polls next wins, and its clones share one key, so under
-    ``per_domain=True`` every host draws on the same limit. Ordering,
-    prompt hand-back and per-host keys are the implementation's to provide
-    if it needs them; :class:`SyncRateLimiter` is where arrival ordering
-    and a :meth:`~SyncRateLimiter.release` hook come from otherwise.
-
-    Algorithms that can reserve a slot without awaiting should subclass
-    :class:`SyncRateLimiter` instead, which supplies :meth:`wait` for them.
+    An async method that contains no suspension point still runs atomically
+    when awaited directly. :class:`TokenBucket` relies on that property to
+    preserve arrival ordering on one event loop.
     """
 
     @abstractmethod
-    async def wait(self, timeout: float | None = None) -> None:
-        """Reserve a slot and wait until the request may be sent.
+    async def acquire(self) -> float:
+        """Reserve a slot and return the delay to sleep before sending.
 
-        Raise :exc:`asyncio.TimeoutError` if the slot could not be had
-        within *timeout*, rather than waiting past it. A *timeout* of
-        ``None`` means wait as long as it takes.
+        If cancellation or another exception prevents this method from
+        returning, it must not leave a reservation behind.
         """
 
     @abstractmethod
@@ -76,24 +54,6 @@ class RateLimiter(ABC):
 
         Per-domain mode clones the configured limiter once per target
         host, so state (queued slots, accrued tokens) must not carry over.
-        """
-
-
-class SyncRateLimiter(RateLimiter):
-    """Base class for algorithms that reserve a slot without awaiting.
-
-    Implementations provide :meth:`acquire` and :meth:`clone`, and may
-    override :meth:`release`; the sleeping and timeout logic lives here in
-    :meth:`wait`. Because :meth:`acquire` does not await, callers on one
-    event loop reserve slots atomically, in arrival order.
-    """
-
-    @abstractmethod
-    def acquire(self) -> float:
-        """Reserve a slot and return the delay to sleep before sending.
-
-        Must return without awaiting: the arrival-order guarantee above
-        holds precisely because there is no suspension point here.
         """
 
     def release(self) -> None:
@@ -110,18 +70,21 @@ class SyncRateLimiter(RateLimiter):
         """
 
     async def wait(self, timeout: float | None = None) -> None:
-        """Reserve a slot and sleep out its delay.
+        """Reserve a slot and wait until the request may be sent.
 
-        When the delay would exceed *timeout*, the slot is handed back and
-        :exc:`asyncio.TimeoutError` is raised without sleeping, so a
-        request that could never be sent in time fails fast.
+        Acquisition time counts against *timeout*. When the returned delay
+        exceeds the remaining budget, the slot is handed back and
+        :exc:`asyncio.TimeoutError` is raised without sleeping.
         """
-        delay = self.acquire()
-        if timeout is not None and delay > timeout:
+        started = time.monotonic()
+        delay = await self.acquire()
+        remaining = None if timeout is None else timeout - (time.monotonic() - started)
+
+        if remaining is not None and delay > remaining:
             self.release()
             raise asyncio.TimeoutError(
                 f"rate limiter would delay the request {delay:.3f}s, "
-                f"beyond the {timeout:.3f}s timeout"
+                f"beyond the {max(0.0, remaining):.3f}s remaining timeout"
             )
         if delay > 0.0:
             try:
@@ -133,7 +96,7 @@ class SyncRateLimiter(RateLimiter):
                 raise
 
 
-class TokenBucket(SyncRateLimiter):
+class TokenBucket(RateLimiter):
     """Token bucket: tokens accrue at ``rate`` per second, capped at ``burst``.
 
     ``acquire`` takes one token immediately and returns the delay the caller
@@ -168,11 +131,13 @@ class TokenBucket(SyncRateLimiter):
         )
         self._last_refill = now
 
-    def acquire(self) -> float:
+    async def acquire(self) -> float:
         """Take one token and return the delay to sleep before sending.
 
         The delay is the exact fractional deficit (not rounded to whole
         intervals), so a caller never waits longer than the bucket needs.
+        There is deliberately no suspension point: callers on one event
+        loop reserve slots atomically, in arrival order.
         """
         self._refill()
         self._tokens -= 1.0
@@ -193,17 +158,15 @@ class RateLimitMiddleware:
 
     The middleware waits on the limiter before sending, so the client never
     sends faster than the limiter allows. What that ordering is worth is the
-    limiter's to say: a :class:`SyncRateLimiter` grants slots in arrival
-    order, while a :class:`RateLimiter` implementing :meth:`~RateLimiter.wait`
-    itself orders callers however it chooses.
+    limiter's to say. :class:`TokenBucket` grants slots in arrival order
+    because its :meth:`~RateLimiter.acquire` has no suspension point.
 
-    Under a :class:`SyncRateLimiter`, cancellation is the one exception to
-    arrival order: a slot handed back by :meth:`SyncRateLimiter.release`
-    frees capacity that queued callers have already been given fixed delays
-    against, so two of them can briefly send in the same instant. And when
-    aiohttp exposes the request's timeout (aiohttp 3.15 and newer), a wait
-    that would exceed it fails immediately with :exc:`asyncio.TimeoutError`
-    instead of sleeping toward a guaranteed timeout.
+    For :class:`TokenBucket`, cancellation is the one exception to arrival
+    order: a handed-back slot frees capacity that queued callers have already
+    been given fixed delays against, so two of them can briefly send in the
+    same instant. When aiohttp exposes the request's timeout (aiohttp 3.15
+    and newer), a wait that would exceed it fails immediately with
+    :exc:`asyncio.TimeoutError` instead of sleeping toward a guaranteed timeout.
 
     Middleware order matters: middlewares listed earlier wrap the ones listed
     later, and a middleware that retries internally (for example,
