@@ -1,0 +1,7 @@
+Made :meth:`~aiohttp_client_middlewares.RateLimiter.acquire` async, so a rate
+limiter may reserve its slot through Redis, a database, or another I/O-backed
+service without replacing the shared ``wait()`` logic. ``wait()`` now charges
+acquisition time against the timeout before sleeping out the returned delay,
+and an ``acquire()`` implementation is responsible for leaving no reservation
+behind if it is cancelled or raises before returning
+-- by :user:`rodrigobnogueira`.
