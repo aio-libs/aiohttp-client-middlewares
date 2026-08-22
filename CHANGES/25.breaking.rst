@@ -1,17 +1,15 @@
-Made :meth:`~aiohttp_client_middlewares.RateLimiter.acquire` async so rate
-limiters may reserve slots through Redis, a database, or another I/O-backed
-service without replacing the shared wait logic.
+Made :meth:`~aiohttp_client_middlewares.RateLimiter.acquire` async, so a rate
+limiter may reserve its slot through Redis, a database, or another I/O-backed
+service without replacing the shared ``wait()`` logic. ``wait()`` now charges
+acquisition time against the timeout before sleeping out the returned delay,
+and an ``acquire()`` implementation is responsible for leaving no reservation
+behind if it is cancelled or raises before returning.
 
-:class:`~aiohttp_client_middlewares.RateLimiter` continues to supply
-``wait()``, which now charges acquisition time against the timeout before
-sleeping out the returned delay. It also continues to own timeout and
-post-reservation cancellation cleanup through ``release()``. An ``acquire()``
-implementation is responsible for leaving no reservation behind if it is
-cancelled or raises before returning.
-
-To upgrade, change a synchronous ``def acquire(self)`` implementation to
-``async def acquire(self)`` and await any direct calls to it. An implementation
-that needs no I/O can omit ``await`` internally; it then retains atomic
-arrival-order reservation on one event loop, as
-:class:`~aiohttp_client_middlewares.TokenBucket` does
+To upgrade, change ``def acquire(self)`` to ``async def acquire(self)`` and
+await any direct calls to it; an implementation that needs no I/O can simply
+not await, keeping the atomic arrival-order reservation
+:class:`~aiohttp_client_middlewares.TokenBucket` relies on. A limiter that
+instead overrode ``wait()`` and stubbed out ``acquire()``, as the previous
+documentation suggested, keeps working but no longer type-checks: give it a
+real ``async def acquire()`` and drop the override
 -- by :user:`rodrigobnogueira`.

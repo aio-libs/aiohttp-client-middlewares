@@ -14,21 +14,17 @@ import math
 import time
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from typing import TypeVar
 
 from aiohttp import ClientHandlerType, ClientRequest, ClientResponse, ClientTimeout
-
-# clone() returns a limiter of the caller's own type, so narrowing survives it.
-_LimiterT = TypeVar("_LimiterT", bound="RateLimiter")
 
 
 class RateLimiter(ABC):
     """Base class for rate-limit algorithms.
 
-    Implementations provide the async :meth:`acquire` and :meth:`clone`;
-    the sleeping, timeout and post-reservation cancellation logic lives in
-    :meth:`wait`, shared by every algorithm. Reserving a slot may therefore
-    perform I/O of its own -- against Redis or a database, say.
+    Implementations provide an async :meth:`acquire` and a synchronous
+    :meth:`clone`. The sleeping, timeout and post-reservation cancellation
+    logic lives in :meth:`wait`, shared by every algorithm, so reserving a
+    slot may perform I/O of its own -- against Redis or a database, say.
 
     An :meth:`acquire` implementation must be cancellation-safe. If it is
     cancelled or raises before returning, it is responsible for ensuring
@@ -49,8 +45,8 @@ class RateLimiter(ABC):
         """
 
     @abstractmethod
-    def clone(self: _LimiterT) -> _LimiterT:
-        """Return a fresh limiter of this type with the same configuration.
+    def clone(self) -> "RateLimiter":
+        """Return a fresh limiter with the same configuration.
 
         Per-domain mode clones the configured limiter once per target
         host, so state (queued slots, accrued tokens) must not carry over.
@@ -65,27 +61,43 @@ class RateLimiter(ABC):
         that have nothing to return.
 
         Runs from an ``except asyncio.CancelledError`` block, so it must
-        not await either: a second cancellation, or the loop shutting
-        down, would truncate it part-way and lose the slot for good.
+        not await: a second cancellation, or the loop shutting down, would
+        truncate it part-way and lose the slot for good. A limiter that has
+        to reach its backend to hand a slot back can schedule that round
+        trip as a task from here.
+
+        It must not raise, either. :meth:`wait` calls it while unwinding, so
+        an exception here would replace the :exc:`asyncio.TimeoutError` the
+        caller is owed -- or the :exc:`asyncio.CancelledError`, leaving a
+        cancelled request reporting an ordinary failure.
         """
 
     async def wait(self, timeout: float | None = None) -> None:
         """Reserve a slot and wait until the request may be sent.
 
-        Acquisition time counts against *timeout*. When the returned delay
-        exceeds the remaining budget, the slot is handed back and
+        Time spent in :meth:`acquire` is charged against *timeout* once it
+        returns, but is not bounded by it, so an implementation that can
+        hang needs a deadline of its own. When the delay left to serve
+        exceeds what is left of the budget, the slot is handed back and
         :exc:`asyncio.TimeoutError` is raised without sleeping.
         """
         started = time.monotonic()
         delay = await self.acquire()
-        remaining = None if timeout is None else timeout - (time.monotonic() - started)
 
-        if remaining is not None and delay > remaining:
-            self.release()
-            raise asyncio.TimeoutError(
-                f"rate limiter would delay the request {delay:.3f}s, "
-                f"beyond the {max(0.0, remaining):.3f}s remaining timeout"
-            )
+        if timeout is not None:
+            elapsed = time.monotonic() - started
+            remaining = timeout - elapsed
+            if delay > remaining:
+                self.release()
+                if remaining <= 0.0:
+                    raise asyncio.TimeoutError(
+                        f"reserving a rate-limit slot took {elapsed:.3f}s, "
+                        f"exhausting the {timeout:.3f}s timeout"
+                    )
+                raise asyncio.TimeoutError(
+                    f"rate limiter would delay the request {delay:.3f}s, "
+                    f"beyond the {remaining:.3f}s remaining timeout"
+                )
         if delay > 0.0:
             try:
                 await asyncio.sleep(delay)
@@ -235,5 +247,10 @@ class RateLimitMiddleware:
         # the getattr() is gated on raising the floor to 3.15; that change
         # is ready in #23 and waits only on the aiohttp release.
         client_timeout: ClientTimeout | None = getattr(request, "timeout", None)
-        await limiter.wait(None if client_timeout is None else client_timeout.total)
+        total = None if client_timeout is None else client_timeout.total
+        if total is not None and total <= 0.0:
+            # aiohttp arms its own deadline only for a positive total, so a
+            # zero or negative one means "no timeout", not "no budget left".
+            total = None
+        await limiter.wait(total)
         return await handler(request)

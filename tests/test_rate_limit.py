@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+from types import SimpleNamespace
 from unittest import mock
 
 import aiohttp
@@ -10,6 +11,7 @@ from aiohttp import ClientRequest, ClientResponse, web
 from pytest_aiohttp import AiohttpClient
 from yarl import URL
 
+from aiohttp_client_middlewares import rate_limit
 from aiohttp_client_middlewares.rate_limit import (
     RateLimiter,
     RateLimitMiddleware,
@@ -50,7 +52,7 @@ async def _cancel_and_join(task: "asyncio.Future[None]") -> None:
 
 
 class _FakeClock:
-    """A controllable stand-in for ``time.monotonic``."""
+    """A controllable stand-in for the limiter's ``time.monotonic``."""
 
     def __init__(self) -> None:
         self.now = 1000.0
@@ -64,8 +66,16 @@ class _FakeClock:
 
 @pytest.fixture
 def clock(monkeypatch: pytest.MonkeyPatch) -> _FakeClock:
+    """Freeze the limiter's clock without freezing the event loop's.
+
+    Patching :func:`time.monotonic` itself would also stop the clock the loop
+    reads its own deadlines from, so any ``asyncio.sleep`` in a test using
+    this fixture would never wake -- not even under ``asyncio.wait_for``,
+    whose timer is on that same clock. Swap the module reference the limiter
+    holds instead.
+    """
     fake = _FakeClock()
-    monkeypatch.setattr(time, "monotonic", fake)
+    monkeypatch.setattr(rate_limit, "time", SimpleNamespace(monotonic=fake))
     return fake
 
 
@@ -326,7 +336,7 @@ async def test_token_bucket_clone_is_fresh(clock: _FakeClock) -> None:
     assert await fresh.acquire() == pytest.approx(0.1)  # same rate as the template
 
 
-def test_token_bucket_needs_no_event_loop() -> None:
+def test_token_bucket_works_across_sequential_loops() -> None:
     """The bucket holds no loop state and works across sequential loops."""
     bucket = TokenBucket(rate=1000.0, burst=1)
     assert asyncio.run(bucket.acquire()) == 0.0
@@ -478,16 +488,134 @@ async def test_acquisition_cancellation_does_not_call_release() -> None:
     assert limiter.releases == 0
 
 
-async def test_clone_keeps_the_callers_type() -> None:
-    """clone() is typed as returning the caller's own type, not the base.
+class _BudgetEater(RateLimiter):
+    """Limiter whose reservation alone outlasts the caller's whole timeout."""
 
-    Holding a limiter as RateLimiter and cloning it has to keep the concrete
-    return type, so downstream narrowing survives the call.
+    def __init__(self, clock: _FakeClock) -> None:
+        self._clock = clock
+        self.releases = 0
+
+    async def acquire(self) -> float:
+        self._clock.advance(0.5)
+        return 0.0  # no delay left to serve -- the budget went on acquiring
+
+    def release(self) -> None:
+        self.releases += 1
+
+    def clone(self) -> "_BudgetEater":
+        return _BudgetEater(self._clock)
+
+
+async def test_acquisition_alone_can_exhaust_the_timeout(clock: _FakeClock) -> None:
+    """A zero delay still fails once acquiring has spent the whole budget.
+
+    The message has to name acquisition as the cause: reporting a 0.000s delay
+    as exceeding a 0.000s budget would be self-contradictory.
     """
-    limiter: RateLimiter = TokenBucket(rate=10.0, burst=1)
-    fresh = limiter.clone()
+    limiter = _BudgetEater(clock)
 
-    assert isinstance(fresh, TokenBucket)
-    assert fresh is not limiter
-    assert await fresh.acquire() == 0.0  # a fresh bucket, not the drained one
-    fresh.release()
+    with pytest.raises(
+        asyncio.TimeoutError, match=r"took 0\.500s, exhausting the 0\.100s"
+    ):
+        await limiter.wait(timeout=0.1)
+
+    assert limiter.releases == 1
+
+
+async def test_non_positive_total_timeout_means_no_deadline() -> None:
+    """aiohttp arms no deadline for total <= 0, so the limiter must not either.
+
+    Charging acquisition against the budget makes the remaining time negative
+    the moment a zero total arrives, which would otherwise fail every request
+    through the middleware -- including ones the limiter grants instantly.
+    """
+    middleware = RateLimitMiddleware(TokenBucket(rate=1000.0, burst=1))
+    request = _fake_request("example.com", aiohttp.ClientTimeout(total=0))
+    sent = []
+
+    async def handler(req: ClientRequest) -> ClientResponse:
+        sent.append(req)
+        return mock.create_autospec(ClientResponse, instance=True)  # type: ignore[no-any-return]
+
+    await middleware(request, handler)  # granted instantly, from the burst
+    await middleware(request, handler)  # throttled: sleeps rather than raising
+
+    assert len(sent) == 2
+
+
+async def test_clock_fixture_leaves_the_event_loop_running(clock: _FakeClock) -> None:
+    """The fake clock must stay out of :mod:`time`, or sleeps here would hang.
+
+    Asserted by identity rather than by sleeping: were the loop's own clock
+    frozen, the test proving it would never finish.
+    """
+    assert time.monotonic is not clock
+
+
+async def test_token_bucket_acquire_never_yields_to_the_loop(clock: _FakeClock) -> None:
+    """Arrival order rests on acquire() reaching its return without suspending.
+
+    A suspension point anywhere in it would let a later caller overtake an
+    earlier one, so pin the property itself: a task scheduled before the
+    acquire must still be waiting when the acquire comes back.
+    """
+    bucket = TokenBucket(rate=10.0, burst=1)
+    ran = []
+
+    async def competitor() -> None:
+        ran.append("competitor")
+
+    task = asyncio.ensure_future(competitor())
+    await bucket.acquire()
+    assert ran == [], "acquire() yielded, so callers are no longer ordered"
+
+    await task
+    assert ran == ["competitor"]
+
+
+class _RecordsReleases(RateLimiter):
+    """Limiter that grants a fixed delay -- or fails -- and counts hand-backs."""
+
+    def __init__(self, delay: float = 0.0, error: Exception | None = None) -> None:
+        self._delay = delay
+        self._error = error
+        self.releases = 0
+
+    async def acquire(self) -> float:
+        if self._error is not None:
+            raise self._error
+        return self._delay
+
+    def release(self) -> None:
+        self.releases += 1
+
+    def clone(self) -> "_RecordsReleases":
+        return _RecordsReleases(self._delay, self._error)
+
+
+@pytest.mark.parametrize("delay", [0.0, 0.001])
+async def test_wait_keeps_a_slot_it_actually_used(delay: float) -> None:
+    """A slot the caller goes on to use must never be handed back.
+
+    Releasing on the success path -- from a ``finally:`` around the sleep,
+    say -- would quietly hand back every slot and double the rate allowed.
+    """
+    limiter = _RecordsReleases(delay=delay)
+
+    await limiter.wait(timeout=10.0)
+
+    assert limiter.releases == 0
+
+
+async def test_acquire_raising_does_not_call_release() -> None:
+    """A raise before acquire() returns is the implementation's to clean up.
+
+    ``wait()`` owns the reservation only once acquire() has handed one over,
+    so it must not compensate for a reservation that was never made.
+    """
+    limiter = _RecordsReleases(error=RuntimeError("backend down"))
+
+    with pytest.raises(RuntimeError, match="backend down"):
+        await limiter.wait(timeout=10.0)
+
+    assert limiter.releases == 0

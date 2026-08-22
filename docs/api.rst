@@ -93,17 +93,36 @@ Rate limiting
                self._redis, self._key, self._script = redis, key, script
 
            async def acquire(self):
-               # An atomic script reserves the next slot and returns its delay.
-               return await self._redis.evalsha(self._script, 1, self._key)
+               # An atomic script reserves the next slot and returns the delay
+               # in milliseconds: Redis turns Lua numbers into integers, so a
+               # fractional second cannot come back as one.
+               ms = await self._redis.evalsha(self._script, 1, self._key)
+               return ms / 1000
 
            def clone(self):
                return RedisLimiter(self._redis, self._key, self._script)
 
+   Three shortcuts in that sketch matter. Its ``clone()`` reuses one key, so
+   under ``per_domain=True`` every host would draw on a single shared limit;
+   key the clone on the host to keep per-host budgets. It leaves ``release()``
+   at the default no-op, so a slot reserved just before a timeout bail is not
+   handed back. And a cancellation between the script running and its reply
+   arriving leaves a reservation nobody holds. The last two are what an expiry
+   on the reservation is for: give every slot one, and an abandoned slot lapses
+   on its own.
+
    ``wait(timeout=None)`` is supplied by the base class. It charges async
-   acquisition against *timeout*, fails fast when the returned delay exceeds
-   the remaining budget, sleeps otherwise, and calls ``release()`` if a
+   acquisition against *timeout* once ``acquire()`` returns -- it does not
+   bound the call itself, so an implementation that can hang needs a deadline
+   of its own -- then fails fast when the delay left to serve exceeds what is
+   left of the budget, sleeps otherwise, and calls ``release()`` if a
    successfully acquired slot cannot be used. ``release()`` is synchronous
-   and defaults to a no-op for algorithms that have nothing to return.
+   and defaults to a no-op for algorithms that have nothing to return. It stays
+   synchronous because ``wait()`` also calls it from a cancellation handler,
+   where an awaiting implementation can be truncated part-way and lose the slot
+   for good; a limiter that has to reach its backend to hand one back can
+   schedule that round trip as a task. It must not raise either, since
+   ``wait()`` calls it while unwinding.
 
    ``acquire()`` must be cancellation-safe: if cancellation or another
    exception prevents it from returning, it must leave no reservation behind.
