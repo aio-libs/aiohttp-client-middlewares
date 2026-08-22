@@ -1,5 +1,6 @@
-Stopped :class:`~aiohttp_client_middlewares.RateLimitMiddleware` failing every
-request made under ``ClientTimeout(total=0)``. aiohttp arms its own deadline
-only for a positive total, so zero means "no timeout"; the middleware now reads
-it the same way instead of as a budget already spent
+Stopped :class:`~aiohttp_client_middlewares.RateLimitMiddleware` rejecting
+throttled requests made under ``ClientTimeout(total=0)``. aiohttp arms its own
+deadline only for a positive total, so zero means "no timeout"; the middleware
+now reads it the same way rather than as a budget already spent. It only sees a
+request's timeout from aiohttp 3.15 on, so that is where this takes effect
 -- by :user:`rodrigobnogueira`.

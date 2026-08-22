@@ -3,13 +3,5 @@ limiter may reserve its slot through Redis, a database, or another I/O-backed
 service without replacing the shared ``wait()`` logic. ``wait()`` now charges
 acquisition time against the timeout before sleeping out the returned delay,
 and an ``acquire()`` implementation is responsible for leaving no reservation
-behind if it is cancelled or raises before returning.
-
-To upgrade, change ``def acquire(self)`` to ``async def acquire(self)`` and
-await any direct calls to it; an implementation that needs no I/O can simply
-not await, keeping the atomic arrival-order reservation
-:class:`~aiohttp_client_middlewares.TokenBucket` relies on. A limiter that
-instead overrode ``wait()`` and stubbed out ``acquire()``, as the previous
-documentation suggested, keeps working but no longer type-checks: give it a
-real ``async def acquire()`` and drop the override
+behind if it is cancelled or raises before returning
 -- by :user:`rodrigobnogueira`.

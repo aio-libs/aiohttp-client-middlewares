@@ -84,7 +84,8 @@ Rate limiting
 
    Abstract base class for rate-limit algorithms, and the type
    :class:`RateLimitMiddleware` accepts. Implementations provide async
-   ``acquire()``, which reserves a slot and returns its delay in seconds, and
+   ``acquire()``, which reserves a slot and returns its delay as a non-negative
+   finite number of seconds -- ``wait()`` takes that on trust -- and
    ``clone()``, which returns a fresh limiter with the same configuration
    (used once per host by per-domain mode)::
 
@@ -103,13 +104,15 @@ Rate limiting
                return RedisLimiter(self._redis, self._key, self._script)
 
    Three shortcuts in that sketch matter. Its ``clone()`` reuses one key, so
-   under ``per_domain=True`` every host would draw on a single shared limit;
-   key the clone on the host to keep per-host budgets. It leaves ``release()``
-   at the default no-op, so a slot reserved just before a timeout bail is not
-   handed back. And a cancellation between the script running and its reply
-   arriving leaves a reservation nobody holds. The last two are what an expiry
-   on the reservation is for: give every slot one, and an abandoned slot lapses
-   on its own.
+   under ``per_domain=True`` every host would draw on a single shared limit --
+   and since ``clone()`` is called as a no-argument factory it never learns the
+   host, so a shared backend cannot key itself per host that way. Give each host
+   its own limiter, built with its own key, rather than using ``per_domain=True``.
+   It leaves ``release()`` at the default no-op, so a slot reserved just before
+   a timeout bail is not handed back. And a cancellation between the script
+   running and its reply arriving leaves a reservation nobody holds. The last
+   two are what an expiry on the reservation is for: give every slot one, and
+   an abandoned slot lapses on its own.
 
    ``wait(timeout=None)`` is supplied by the base class. It charges async
    acquisition against *timeout* once ``acquire()`` returns -- it does not

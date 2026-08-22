@@ -35,8 +35,9 @@ def _fake_request(
     """A stand-in ``ClientRequest`` exposing just ``.url`` and ``.timeout``.
 
     The timeout is set here, while the mock is still untyped, rather than on
-    the returned value: ``ClientRequest.timeout`` is a read-only property, so
-    assigning it through the ``ClientRequest`` annotation does not type-check.
+    the returned value: the supported aiohttp releases have no
+    ``ClientRequest.timeout`` at all, and 3.15 adds it read-only, so assigning
+    it through the ``ClientRequest`` annotation type-checks on neither.
     """
     req = mock.create_autospec(ClientRequest, instance=True)
     req.url = URL(f"http://{host}")

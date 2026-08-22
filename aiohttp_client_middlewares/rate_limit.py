@@ -40,6 +40,10 @@ class RateLimiter(ABC):
     async def acquire(self) -> float:
         """Reserve a slot and return the delay to sleep before sending.
 
+        The delay must be a non-negative, finite number of seconds.
+        :meth:`wait` takes it on trust: a NaN compares false against both
+        the budget and zero, so the request would go out unthrottled.
+
         If cancellation or another exception prevents this method from
         returning, it must not leave a reservation behind.
         """
