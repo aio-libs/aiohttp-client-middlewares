@@ -218,6 +218,46 @@ def test_per_domain_uses_distinct_limiters() -> None:
     assert len(middleware._domain_limiters) == 2
 
 
+class _KeyedByHost(RateLimiter):
+    """A limiter whose state lives under a key, as a Redis-backed one would."""
+
+    def __init__(self, prefix: str, host: str = "") -> None:
+        self._prefix = prefix
+        self.key = f"{prefix}:{host}" if host else prefix
+
+    async def acquire(self) -> float:
+        return 0.0
+
+    def clone(self, host: str) -> "_KeyedByHost":
+        return _KeyedByHost(self._prefix, host)
+
+
+def test_clone_is_given_the_host_it_is_built_for() -> None:
+    """A shared backend can only scope per host if clone() is told the host."""
+    middleware = RateLimitMiddleware(_KeyedByHost("rl"), per_domain=True)
+
+    a = middleware._get_limiter(_fake_request("a.example"))
+    b = middleware._get_limiter(_fake_request("b.example"))
+
+    assert isinstance(a, _KeyedByHost) and isinstance(b, _KeyedByHost)
+    assert (a.key, b.key) == ("rl:a.example", "rl:b.example")
+
+
+def test_the_template_itself_is_never_handed_out_per_domain() -> None:
+    """Every host gets a clone, so the unscoped template cannot leak through.
+
+    It would carry the bare prefix, quietly pooling that host with any other
+    caller sharing the backend.
+    """
+    template = _KeyedByHost("rl")
+    middleware = RateLimitMiddleware(template, per_domain=True)
+
+    limiter = middleware._get_limiter(_fake_request("a.example"))
+
+    assert limiter is not template
+    assert template.key == "rl"  # untouched
+
+
 def test_global_mode_shares_one_limiter() -> None:
     """Without ``per_domain`` every host goes through the one limiter."""
     middleware = RateLimitMiddleware(TokenBucket(rate=10.0, burst=1))
@@ -232,8 +272,8 @@ def test_global_mode_shares_one_limiter() -> None:
 def test_per_domain_is_readable_and_read_only(per_domain: bool) -> None:
     """``per_domain`` reports the configured mode and cannot be reassigned.
 
-    The limiters are built once in ``__init__``, so a writable attribute
-    would silently do nothing.
+    Which limiter a request gets is decided in ``__init__``, so a writable
+    attribute would silently do nothing.
     """
     middleware = RateLimitMiddleware(
         TokenBucket(rate=10.0, burst=1), per_domain=per_domain
@@ -330,7 +370,7 @@ async def test_token_bucket_clone_is_fresh(clock: _FakeClock) -> None:
     await template.acquire()
     assert await template.acquire() > 0.0  # template drained into debt
 
-    fresh = template.clone()
+    fresh = template.clone("example.com")
     assert await fresh.acquire() == 0.0  # full burst again
     assert await fresh.acquire() == 0.0
     assert await fresh.acquire() == pytest.approx(0.1)  # same rate as the template
@@ -355,7 +395,7 @@ class _FixedDelay(RateLimiter):
     async def acquire(self) -> float:
         return self._delay
 
-    def clone(self) -> "_FixedDelay":
+    def clone(self, host: str) -> "_FixedDelay":
         return _FixedDelay(self._delay)
 
 
@@ -405,7 +445,7 @@ class _AwaitsToReserve(RateLimiter):
         await asyncio.sleep(0)
         return 0.0
 
-    def clone(self) -> "_AwaitsToReserve":
+    def clone(self, host: str) -> "_AwaitsToReserve":
         return _AwaitsToReserve()
 
 
@@ -442,7 +482,7 @@ class _ElapsedAcquire(RateLimiter):
     def release(self) -> None:
         self.releases += 1
 
-    def clone(self) -> "_ElapsedAcquire":
+    def clone(self, host: str) -> "_ElapsedAcquire":
         return _ElapsedAcquire(self._clock, self._spend, self._delay)
 
 
@@ -489,7 +529,7 @@ class _CancelledAcquire(RateLimiter):
     def release(self) -> None:
         self.releases += 1
 
-    def clone(self) -> "_CancelledAcquire":
+    def clone(self, host: str) -> "_CancelledAcquire":
         return _CancelledAcquire()
 
 
@@ -572,7 +612,7 @@ class _RecordsReleases(RateLimiter):
     def release(self) -> None:
         self.releases += 1
 
-    def clone(self) -> "_RecordsReleases":
+    def clone(self, host: str) -> "_RecordsReleases":
         return _RecordsReleases(self._delay, self._error)
 
 
