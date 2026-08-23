@@ -45,7 +45,7 @@ class RateLimiter(ABC):
         """
 
     @abstractmethod
-    def clone(self, host: str) -> "RateLimiter":
+    def clone(self, host: str, /) -> "RateLimiter":
         """Return a fresh limiter, configured the same, scoped to *host*.
 
         Per-domain mode calls this once per target host, so state (queued
@@ -148,7 +148,7 @@ class TokenBucket(RateLimiter):
         self._tokens -= 1.0
         return max(0.0, -self._tokens) * self._interval
 
-    def clone(self, host: str) -> "TokenBucket":
+    def clone(self, host: str, /) -> "TokenBucket":
         """Return a fresh, full bucket with the same rate and burst.
 
         The bucket's state is per-object, so *host* needs no part in it.
@@ -226,7 +226,13 @@ class RateLimitMiddleware:
         assert domain is not None
         limiter = self._domain_limiters.get(domain)
         if limiter is None:
-            limiter = self._domain_limiters[domain] = self._template.clone(domain)
+            # setdefault, not an assignment: threads racing for a host they
+            # have not seen before must all leave with the limiter that was
+            # stored, or each gets a private full budget and the burst
+            # allowance is briefly multiplied by the number of racers.
+            limiter = self._domain_limiters.setdefault(
+                domain, self._template.clone(domain)
+            )
         return limiter
 
     async def __call__(

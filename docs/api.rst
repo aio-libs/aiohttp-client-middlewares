@@ -105,10 +105,11 @@ Rate limiting
 
    Putting *host* in the key is what makes ``per_domain=True`` mean a budget
    per host for a shared backend; a limiter that keeps its state in-process,
-   like :class:`TokenBucket`, has nothing to key and can ignore it. The sketch
-   still leaves ``release()`` at the default no-op, and a cancelled round trip
-   can leave a reservation nobody holds; an expiry on each reservation covers
-   both.
+   like :class:`TokenBucket`, has nothing to key and can ignore it. Redirects
+   pick hosts too, so give those keys an expiry of their own rather than let a
+   shared backend keep one for every host ever seen. The sketch also leaves
+   ``release()`` at the default no-op, and a cancelled round trip can leave a
+   reservation nobody holds; an expiry on each reservation covers both.
 
    ``wait(timeout=None)`` is supplied by the base class. It charges async
    acquisition against *timeout* once ``acquire()`` returns -- without bounding

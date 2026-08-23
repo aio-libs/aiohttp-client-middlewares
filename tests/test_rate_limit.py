@@ -1,6 +1,7 @@
 """Tests for the rate-limiting middleware."""
 
 import asyncio
+import threading
 import time
 from types import SimpleNamespace
 from unittest import mock
@@ -228,7 +229,7 @@ class _KeyedByHost(RateLimiter):
     async def acquire(self) -> float:
         return 0.0
 
-    def clone(self, host: str) -> "_KeyedByHost":
+    def clone(self, host: str, /) -> "_KeyedByHost":
         return _KeyedByHost(self._prefix, host)
 
 
@@ -243,19 +244,46 @@ def test_clone_is_given_the_host_it_is_built_for() -> None:
     assert (a.key, b.key) == ("rl:a.example", "rl:b.example")
 
 
-def test_the_template_itself_is_never_handed_out_per_domain() -> None:
-    """Every host gets a clone, so the unscoped template cannot leak through.
+class _BlocksInClone(RateLimiter):
+    """Limiter whose ``clone()`` holds each caller until they have all arrived."""
 
-    It would carry the bare prefix, quietly pooling that host with any other
-    caller sharing the backend.
+    def __init__(self, barrier: threading.Barrier, host: str = "") -> None:
+        self._barrier = barrier
+        self.host = host
+
+    async def acquire(self) -> float:
+        return 0.0
+
+    def clone(self, host: str, /) -> "_BlocksInClone":
+        self._barrier.wait()
+        return _BlocksInClone(self._barrier, host)
+
+
+def test_first_contact_hands_every_racer_the_stored_limiter() -> None:
+    """Threads meeting a new host at once must all leave with the same limiter.
+
+    Each keeping the one it built would hand every racer a private, full
+    budget, multiplying the burst allowance by the number of racers for that
+    instant. ``dict.setdefault`` is what makes the winner the one everybody
+    gets; a plain assignment does not.
     """
-    template = _KeyedByHost("rl")
-    middleware = RateLimitMiddleware(template, per_domain=True)
+    racers = 4
+    barrier = threading.Barrier(racers, timeout=10)
+    middleware = RateLimitMiddleware(_BlocksInClone(barrier), per_domain=True)
+    handed_out: list[RateLimiter] = []
 
-    limiter = middleware._get_limiter(_fake_request("a.example"))
+    def race() -> None:
+        handed_out.append(middleware._get_limiter(_fake_request("new.example")))
 
-    assert limiter is not template
-    assert template.key == "rl"  # untouched
+    threads = [threading.Thread(target=race) for _ in range(racers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert len(handed_out) == racers
+    stored = middleware._domain_limiters["new.example"]
+    assert all(limiter is stored for limiter in handed_out)
 
 
 def test_global_mode_shares_one_limiter() -> None:
@@ -395,7 +423,7 @@ class _FixedDelay(RateLimiter):
     async def acquire(self) -> float:
         return self._delay
 
-    def clone(self, host: str) -> "_FixedDelay":
+    def clone(self, host: str, /) -> "_FixedDelay":
         return _FixedDelay(self._delay)
 
 
@@ -445,7 +473,7 @@ class _AwaitsToReserve(RateLimiter):
         await asyncio.sleep(0)
         return 0.0
 
-    def clone(self, host: str) -> "_AwaitsToReserve":
+    def clone(self, host: str, /) -> "_AwaitsToReserve":
         return _AwaitsToReserve()
 
 
@@ -482,7 +510,7 @@ class _ElapsedAcquire(RateLimiter):
     def release(self) -> None:
         self.releases += 1
 
-    def clone(self, host: str) -> "_ElapsedAcquire":
+    def clone(self, host: str, /) -> "_ElapsedAcquire":
         return _ElapsedAcquire(self._clock, self._spend, self._delay)
 
 
@@ -529,7 +557,7 @@ class _CancelledAcquire(RateLimiter):
     def release(self) -> None:
         self.releases += 1
 
-    def clone(self, host: str) -> "_CancelledAcquire":
+    def clone(self, host: str, /) -> "_CancelledAcquire":
         return _CancelledAcquire()
 
 
@@ -612,7 +640,7 @@ class _RecordsReleases(RateLimiter):
     def release(self) -> None:
         self.releases += 1
 
-    def clone(self, host: str) -> "_RecordsReleases":
+    def clone(self, host: str, /) -> "_RecordsReleases":
         return _RecordsReleases(self._delay, self._error)
 
 
