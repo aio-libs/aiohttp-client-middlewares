@@ -103,29 +103,22 @@ Rate limiting
            def clone(self):
                return RedisLimiter(self._redis, self._key, self._script)
 
-   Three shortcuts in that sketch matter. Its ``clone()`` reuses one key, so
-   under ``per_domain=True`` every host would draw on a single shared limit --
-   and since ``clone()`` is called as a no-argument factory it never learns the
-   host, so a shared backend cannot key itself per host that way. Give each host
-   its own limiter, built with its own key, rather than using ``per_domain=True``.
-   It leaves ``release()`` at the default no-op, so a slot reserved just before
-   a timeout bail is not handed back. And a cancellation between the script
-   running and its reply arriving leaves a reservation nobody holds. The last
-   two are what an expiry on the reservation is for: give every slot one, and
-   an abandoned slot lapses on its own.
+   The sketch keeps one key across clones, and ``clone()`` takes no arguments
+   so it cannot learn the host; give each host its own limiter rather than
+   using ``per_domain=True``. It also leaves ``release()`` at the default
+   no-op, and a cancelled round trip can leave a reservation nobody holds;
+   an expiry on each reservation covers both.
 
    ``wait(timeout=None)`` is supplied by the base class. It charges async
-   acquisition against *timeout* once ``acquire()`` returns -- it does not
-   bound the call itself, so an implementation that can hang needs a deadline
-   of its own -- then fails fast when the delay left to serve exceeds what is
-   left of the budget, sleeps otherwise, and calls ``release()`` if a
-   successfully acquired slot cannot be used. ``release()`` is synchronous
-   and defaults to a no-op for algorithms that have nothing to return. It stays
-   synchronous because ``wait()`` also calls it from a cancellation handler,
-   where an awaiting implementation can be truncated part-way and lose the slot
-   for good; a limiter that has to reach its backend to hand one back can
-   schedule that round trip as a task. It must not raise either, since
-   ``wait()`` calls it while unwinding.
+   acquisition against *timeout* once ``acquire()`` returns -- without bounding
+   the call itself, so an implementation that can hang needs its own deadline --
+   then fails fast when the delay exceeds what is left, sleeps otherwise, and
+   calls ``release()`` if an acquired slot cannot be used. ``release()`` defaults
+   to a no-op for algorithms with nothing to return, and stays synchronous: one
+   of those calls is from a cancellation handler, where awaiting can be truncated
+   part-way and lose the slot for good, and raising would replace the exception
+   the caller is owed. A limiter that has to reach its backend to hand a slot
+   back can schedule that round trip as a task.
 
    ``acquire()`` must be cancellation-safe: if cancellation or another
    exception prevents it from returning, it must leave no reservation behind.

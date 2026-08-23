@@ -35,9 +35,8 @@ def _fake_request(
     """A stand-in ``ClientRequest`` exposing just ``.url`` and ``.timeout``.
 
     The timeout is set here, while the mock is still untyped, rather than on
-    the returned value: the supported aiohttp releases have no
-    ``ClientRequest.timeout`` at all, and 3.15 adds it read-only, so assigning
-    it through the ``ClientRequest`` annotation type-checks on neither.
+    the returned value: ``ClientRequest.timeout`` is a read-only property, so
+    assigning it through the ``ClientRequest`` annotation does not type-check.
     """
     req = mock.create_autospec(ClientRequest, instance=True)
     req.url = URL(f"http://{host}")
@@ -428,28 +427,45 @@ async def test_middleware_drives_an_awaiting_limiter() -> None:
 
 
 class _ElapsedAcquire(RateLimiter):
-    """Limiter that advances a fake clock while reserving a slot."""
+    """Limiter that spends fake time reserving a slot, then asks for a delay."""
 
-    def __init__(self, clock: _FakeClock) -> None:
+    def __init__(self, clock: _FakeClock, spend: float, delay: float) -> None:
         self._clock = clock
+        self._spend = spend
+        self._delay = delay
         self.releases = 0
 
     async def acquire(self) -> float:
-        self._clock.advance(0.075)
-        return 0.05
+        self._clock.advance(self._spend)
+        return self._delay
 
     def release(self) -> None:
         self.releases += 1
 
     def clone(self) -> "_ElapsedAcquire":
-        return _ElapsedAcquire(self._clock)
+        return _ElapsedAcquire(self._clock, self._spend, self._delay)
 
 
-async def test_acquisition_time_reduces_remaining_timeout(clock: _FakeClock) -> None:
-    """The delay is checked against the budget left after acquisition."""
-    limiter = _ElapsedAcquire(clock)
+@pytest.mark.parametrize(
+    ("spend", "delay", "budget_left"),
+    (
+        (0.075, 0.05, r"0\.025s"),  # some budget survived acquisition
+        (0.5, 0.0, r"-0\.400s"),  # acquiring alone outlasted the whole timeout
+    ),
+)
+async def test_acquisition_time_reduces_remaining_timeout(
+    clock: _FakeClock, spend: float, delay: float, budget_left: str
+) -> None:
+    """The delay is checked against the budget left after acquisition.
 
-    with pytest.raises(asyncio.TimeoutError, match="remaining timeout"):
+    The overrun case reports a negative budget rather than clamping it: a
+    0.000s delay said to exceed a 0.000s timeout explains nothing.
+    """
+    limiter = _ElapsedAcquire(clock, spend, delay)
+
+    with pytest.raises(
+        asyncio.TimeoutError, match=f"beyond the {budget_left} remaining"
+    ):
         await limiter.wait(timeout=0.1)
 
     assert limiter.releases == 1
@@ -480,47 +496,13 @@ class _CancelledAcquire(RateLimiter):
 async def test_acquisition_cancellation_does_not_call_release() -> None:
     """Cleanup before acquire returns belongs to the acquire implementation."""
     limiter = _CancelledAcquire()
-    task = asyncio.ensure_future(limiter.wait(timeout=60.0))
+    task = asyncio.create_task(limiter.wait(timeout=60.0))
     await asyncio.sleep(0)
 
     await _cancel_and_join(task)
 
     assert limiter.cancelled
     assert limiter.releases == 0
-
-
-class _BudgetEater(RateLimiter):
-    """Limiter whose reservation alone outlasts the caller's whole timeout."""
-
-    def __init__(self, clock: _FakeClock) -> None:
-        self._clock = clock
-        self.releases = 0
-
-    async def acquire(self) -> float:
-        self._clock.advance(0.5)
-        return 0.0  # no delay left to serve -- the budget went on acquiring
-
-    def release(self) -> None:
-        self.releases += 1
-
-    def clone(self) -> "_BudgetEater":
-        return _BudgetEater(self._clock)
-
-
-async def test_acquisition_alone_can_exhaust_the_timeout(clock: _FakeClock) -> None:
-    """A zero delay still fails once acquiring has spent the whole budget.
-
-    The message has to name acquisition as the cause: reporting a 0.000s delay
-    as exceeding a 0.000s budget would be self-contradictory.
-    """
-    limiter = _BudgetEater(clock)
-
-    with pytest.raises(
-        asyncio.TimeoutError, match=r"took 0\.500s, exhausting the 0\.100s"
-    ):
-        await limiter.wait(timeout=0.1)
-
-    assert limiter.releases == 1
 
 
 async def test_non_positive_total_timeout_means_no_deadline() -> None:
@@ -566,7 +548,7 @@ async def test_token_bucket_acquire_never_yields_to_the_loop(clock: _FakeClock) 
     async def competitor() -> None:
         ran.append("competitor")
 
-    task = asyncio.ensure_future(competitor())
+    task = asyncio.create_task(competitor())
     await bucket.acquire()
     assert ran == [], "acquire() yielded, so callers are no longer ordered"
 
@@ -594,7 +576,7 @@ class _RecordsReleases(RateLimiter):
         return _RecordsReleases(self._delay, self._error)
 
 
-@pytest.mark.parametrize("delay", [0.0, 0.001])
+@pytest.mark.parametrize("delay", (0.0, 0.001))
 async def test_wait_keeps_a_slot_it_actually_used(delay: float) -> None:
     """A slot the caller goes on to use must never be handed back.
 

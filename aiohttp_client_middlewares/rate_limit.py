@@ -26,10 +26,9 @@ class RateLimiter(ABC):
     logic lives in :meth:`wait`, shared by every algorithm, so reserving a
     slot may perform I/O of its own -- against Redis or a database, say.
 
-    An :meth:`acquire` implementation must be cancellation-safe. If it is
-    cancelled or raises before returning, it is responsible for ensuring
-    that no reservation is left behind. Once it returns, :meth:`wait` owns
-    the reservation and calls :meth:`release` if the slot cannot be used.
+    Until :meth:`acquire` returns, cleaning up a half-made reservation is
+    its own responsibility; once it returns, :meth:`wait` owns the slot and
+    calls :meth:`release` if it cannot be used.
 
     An async method that contains no suspension point still runs atomically
     when awaited directly. :class:`TokenBucket` relies on that property to
@@ -40,11 +39,9 @@ class RateLimiter(ABC):
     async def acquire(self) -> float:
         """Reserve a slot and return the delay to sleep before sending.
 
-        The delay must be a non-negative, finite number of seconds.
-        :meth:`wait` takes it on trust: a NaN compares false against both
-        the budget and zero, so the request would go out unthrottled.
-
-        If cancellation or another exception prevents this method from
+        The delay must be non-negative, finite seconds; :meth:`wait` takes that
+        on trust, and a NaN would send the request through unthrottled. If
+        cancellation or another exception prevents this method from
         returning, it must not leave a reservation behind.
         """
 
@@ -64,40 +61,31 @@ class RateLimiter(ABC):
         cancelled while sleeping. The default is a no-op for algorithms
         that have nothing to return.
 
-        Runs from an ``except asyncio.CancelledError`` block, so it must
-        not await: a second cancellation, or the loop shutting down, would
-        truncate it part-way and lose the slot for good. A limiter that has
-        to reach its backend to hand a slot back can schedule that round
-        trip as a task from here.
-
-        It must not raise, either. :meth:`wait` calls it while unwinding, so
-        an exception here would replace the :exc:`asyncio.TimeoutError` the
-        caller is owed -- or the :exc:`asyncio.CancelledError`, leaving a
-        cancelled request reporting an ordinary failure.
+        Must neither await nor raise, since one of those calls is from an
+        ``except asyncio.CancelledError`` block: awaiting there can be
+        truncated part-way, and raising would replace the exception the
+        caller is owed. A limiter that has to reach its backend to hand a
+        slot back can schedule that round trip as a task from here.
         """
 
     async def wait(self, timeout: float | None = None) -> None:
         """Reserve a slot and wait until the request may be sent.
 
-        Time spent in :meth:`acquire` is charged against *timeout* once it
-        returns, but is not bounded by it, so an implementation that can
-        hang needs a deadline of its own. When the delay left to serve
-        exceeds what is left of the budget, the slot is handed back and
-        :exc:`asyncio.TimeoutError` is raised without sleeping.
+        Time in :meth:`acquire` is charged against *timeout* once it
+        returns, though not bounded by it, so an implementation that can
+        hang needs its own deadline. When the delay exceeds what is left,
+        the slot is handed back and :exc:`asyncio.TimeoutError` raised
+        without sleeping.
         """
         started = time.monotonic()
         delay = await self.acquire()
 
         if timeout is not None:
-            elapsed = time.monotonic() - started
-            remaining = timeout - elapsed
+            # Goes negative when acquiring alone outlasted the timeout; the
+            # message reports it as such rather than clamping it to zero.
+            remaining = timeout - (time.monotonic() - started)
             if delay > remaining:
                 self.release()
-                if remaining <= 0.0:
-                    raise asyncio.TimeoutError(
-                        f"reserving a rate-limit slot took {elapsed:.3f}s, "
-                        f"exhausting the {timeout:.3f}s timeout"
-                    )
                 raise asyncio.TimeoutError(
                     f"rate limiter would delay the request {delay:.3f}s, "
                     f"beyond the {remaining:.3f}s remaining timeout"
