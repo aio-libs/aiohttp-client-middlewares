@@ -86,8 +86,10 @@ Rate limiting
    :class:`RateLimitMiddleware` accepts. Implementations provide async
    ``acquire()``, which reserves a slot and returns its delay as a non-negative
    finite number of seconds -- ``wait()`` takes that on trust -- and
-   ``clone()``, which returns a fresh limiter with the same configuration
-   (used once per host by per-domain mode)::
+   ``clone(host)``, which returns a fresh limiter with the same configuration
+   scoped to one host (called when per-domain mode first meets a host; a
+   racing thread's extra clone is discarded, so it should have no side
+   effects)::
 
        class RedisLimiter(RateLimiter):
            def __init__(self, redis, key, script):
@@ -100,14 +102,16 @@ Rate limiting
                ms = await self._redis.evalsha(self._script, 1, self._key)
                return ms / 1000
 
-           def clone(self):
-               return RedisLimiter(self._redis, self._key, self._script)
+           def clone(self, host):
+               return RedisLimiter(self._redis, f"{self._key}:{host}", self._script)
 
-   The sketch keeps one key across clones, and ``clone()`` takes no arguments
-   so it cannot learn the host; give each host its own limiter rather than
-   using ``per_domain=True``. It also leaves ``release()`` at the default
-   no-op, and a cancelled round trip can leave a reservation nobody holds;
-   an expiry on each reservation covers both.
+   Putting *host* in the key is what makes ``per_domain=True`` mean a budget
+   per host for a shared backend; a limiter that keeps its state in-process,
+   like :class:`TokenBucket`, has nothing to key and can ignore it. Redirects
+   pick hosts too, so give those keys an expiry of their own rather than let a
+   shared backend keep one for every host ever seen. The sketch also leaves
+   ``release()`` at the default no-op, and a cancelled round trip can leave a
+   reservation nobody holds; an expiry on each reservation covers both.
 
    ``wait(timeout=None)`` is supplied by the base class. It charges async
    acquisition against *timeout* once ``acquire()`` returns -- without bounding
@@ -150,7 +154,7 @@ Rate limiting
 
    :param RateLimiter limiter: The :class:`RateLimiter` to throttle with --
       for example ``TokenBucket(rate=5.0, burst=2)``. With ``per_domain=True``
-      it acts as a template: each target host gets ``limiter.clone()`` the
+      it acts as a template: each target host gets ``limiter.clone(host)`` the
       first time that host is seen.
    :param bool per_domain: Keep an independent limiter per target host instead
       of a single global one. Limiters are keyed on the URL host only (port

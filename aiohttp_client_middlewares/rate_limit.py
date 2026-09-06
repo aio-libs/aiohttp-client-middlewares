@@ -13,7 +13,6 @@ import asyncio
 import math
 import time
 from abc import ABC, abstractmethod
-from collections import defaultdict
 
 from aiohttp import ClientHandlerType, ClientRequest, ClientResponse, ClientTimeout
 
@@ -46,11 +45,15 @@ class RateLimiter(ABC):
         """
 
     @abstractmethod
-    def clone(self) -> "RateLimiter":
-        """Return a fresh limiter with the same configuration.
+    def clone(self, host: str, /) -> "RateLimiter":
+        """Return a fresh limiter, configured the same, scoped to *host*.
 
-        Per-domain mode clones the configured limiter once per target
-        host, so state (queued slots, accrued tokens) must not carry over.
+        Per-domain mode calls this the first time it meets a host, so state
+        (queued slots, accrued tokens) must not carry over. Threads racing on
+        that first contact may each build one and only one is kept, so the
+        call itself should have no side effects. An algorithm that keeps its
+        state in-process can ignore *host*; one that keeps it in a shared
+        backend needs it in the key, or every host draws on one limit.
         """
 
     def release(self) -> None:
@@ -147,8 +150,11 @@ class TokenBucket(RateLimiter):
         self._tokens -= 1.0
         return max(0.0, -self._tokens) * self._interval
 
-    def clone(self) -> "TokenBucket":
-        """Return a fresh, full bucket with the same rate and burst."""
+    def clone(self, host: str, /) -> "TokenBucket":
+        """Return a fresh, full bucket with the same rate and burst.
+
+        The bucket's state is per-object, so *host* needs no part in it.
+        """
         return TokenBucket(rate=self._rate, burst=int(self._burst))
 
     def release(self) -> None:
@@ -182,7 +188,7 @@ class RateLimitMiddleware:
     :param RateLimiter limiter: The :class:`RateLimiter` to throttle with --
         for example ``TokenBucket(rate=5.0, burst=2)``. With
         ``per_domain=True`` it acts as a template: each target host gets
-        ``limiter.clone()`` the first time that host is seen.
+        ``limiter.clone(host)`` the first time that host is seen.
     :param bool per_domain: When ``True``, keep an independent limiter per
         target host instead of a single global one. Limiters are keyed on the
         URL host only (port and scheme are not distinguished) and are never
@@ -198,31 +204,39 @@ class RateLimitMiddleware:
     ) -> None:
         if not isinstance(limiter, RateLimiter):
             raise TypeError(f"limiter must be a RateLimiter, got {limiter!r}")
-        self._per_domain = per_domain
-        self._global_limiter: RateLimiter | None = None
-        if per_domain:
-            self._domain_limiters: dict[str, RateLimiter] = defaultdict(limiter.clone)
-        else:
-            self._global_limiter = limiter
+        # The one limiter in global mode; the template to clone in per-domain
+        # mode. Whether the per-host dict exists is what says which.
+        self._limiter = limiter
+        self._domain_limiters: dict[str, RateLimiter] | None = (
+            {} if per_domain else None
+        )
 
     @property
     def per_domain(self) -> bool:
         """Whether this middleware keeps one limiter per target host.
 
-        Read-only: the limiters are built once in ``__init__``, so flipping
-        this afterwards could not take effect.
+        Read-only: which limiter a request gets is decided in ``__init__``,
+        so flipping this afterwards could not take effect.
         """
-        return self._per_domain
+        return self._domain_limiters is not None
 
     def _get_limiter(self, request: ClientRequest) -> RateLimiter:
-        if self._global_limiter is not None:
-            return self._global_limiter
+        limiters = self._domain_limiters
+        if limiters is None:
+            return self._limiter
         # aiohttp raises InvalidUrlClientError for host-less URLs before
         # any middleware runs (on redirects too), so ``host`` is only
         # ``None`` in the type; the assert narrows it for mypy.
         domain = request.url.host
         assert domain is not None
-        return self._domain_limiters[domain]
+        limiter = limiters.get(domain)
+        if limiter is None:
+            # setdefault, not an assignment: threads racing for a host they
+            # have not seen before must all leave with the limiter that was
+            # stored, or each gets a private full budget and the burst
+            # allowance is briefly multiplied by the number of racers.
+            limiter = limiters.setdefault(domain, self._limiter.clone(domain))
+        return limiter
 
     async def __call__(
         self,

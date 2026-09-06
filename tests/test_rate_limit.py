@@ -1,6 +1,7 @@
 """Tests for the rate-limiting middleware."""
 
 import asyncio
+import threading
 import time
 from types import SimpleNamespace
 from unittest import mock
@@ -215,7 +216,93 @@ def test_per_domain_uses_distinct_limiters() -> None:
 
     assert limiter_a is not limiter_b  # distinct hosts -> isolated limiters
     assert limiter_a is limiter_a_again  # same host -> same limiter
+    assert middleware._domain_limiters is not None
     assert len(middleware._domain_limiters) == 2
+
+
+class _KeyedByHost(RateLimiter):
+    """A limiter whose state lives under a key, as a Redis-backed one would.
+
+    Every host it is cloned for is recorded on a list the clones share with
+    their template, so a test can see how often the middleware asks.
+    """
+
+    def __init__(
+        self, prefix: str, host: str = "", clones: list[str] | None = None
+    ) -> None:
+        self._prefix = prefix
+        self.key = f"{prefix}:{host}" if host else prefix
+        self.clones = [] if clones is None else clones
+
+    async def acquire(self) -> float:
+        return 0.0
+
+    def clone(self, host: str, /) -> "_KeyedByHost":
+        self.clones.append(host)
+        return _KeyedByHost(self._prefix, host, self.clones)
+
+
+def test_clone_is_given_the_host_it_is_built_for() -> None:
+    """A shared backend can only scope per host if clone() is told the host.
+
+    A host seen again gets the stored limiter back without another clone.
+    """
+    template = _KeyedByHost("rl")
+    middleware = RateLimitMiddleware(template, per_domain=True)
+
+    a = middleware._get_limiter(_fake_request("a.example"))
+    b = middleware._get_limiter(_fake_request("b.example"))
+    a_again = middleware._get_limiter(_fake_request("a.example"))
+
+    assert isinstance(a, _KeyedByHost) and isinstance(b, _KeyedByHost)
+    assert (a.key, b.key) == ("rl:a.example", "rl:b.example")
+    assert a_again is a
+    assert template.clones == ["a.example", "b.example"]
+
+
+class _BlocksInClone(RateLimiter):
+    """Limiter whose ``clone()`` holds each caller until they have all arrived."""
+
+    def __init__(self, barrier: threading.Barrier, host: str = "") -> None:
+        self._barrier = barrier
+        self.host = host
+
+    async def acquire(self) -> float:
+        return 0.0
+
+    def clone(self, host: str, /) -> "_BlocksInClone":
+        self._barrier.wait()
+        return _BlocksInClone(self._barrier, host)
+
+
+def test_first_contact_hands_every_racer_the_stored_limiter() -> None:
+    """Threads meeting a new host at once must all leave with the same limiter.
+
+    Each keeping the one it built would hand every racer a private, full
+    budget, multiplying the burst allowance by the number of racers for that
+    instant. ``dict.setdefault`` is what makes the winner the one everybody
+    gets; a plain assignment does not. The barrier sits inside ``clone()``,
+    so this also pins that the miss path stays lock-free: every racer builds
+    one and the extra clones are discarded.
+    """
+    racers = 4
+    barrier = threading.Barrier(racers, timeout=10)
+    middleware = RateLimitMiddleware(_BlocksInClone(barrier), per_domain=True)
+    handed_out: list[RateLimiter] = []
+
+    def race() -> None:
+        handed_out.append(middleware._get_limiter(_fake_request("new.example")))
+
+    threads = [threading.Thread(target=race) for _ in range(racers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert len(handed_out) == racers
+    assert middleware._domain_limiters is not None
+    stored = middleware._domain_limiters["new.example"]
+    assert all(limiter is stored for limiter in handed_out)
 
 
 def test_global_mode_shares_one_limiter() -> None:
@@ -225,15 +312,15 @@ def test_global_mode_shares_one_limiter() -> None:
     limiter_a = middleware._get_limiter(_fake_request("a.example"))
     limiter_b = middleware._get_limiter(_fake_request("b.example"))
 
-    assert limiter_a is limiter_b is middleware._global_limiter
+    assert limiter_a is limiter_b is middleware._limiter
 
 
 @pytest.mark.parametrize("per_domain", (False, True))
 def test_per_domain_is_readable_and_read_only(per_domain: bool) -> None:
     """``per_domain`` reports the configured mode and cannot be reassigned.
 
-    The limiters are built once in ``__init__``, so a writable attribute
-    would silently do nothing.
+    Which limiter a request gets is decided in ``__init__``, so a writable
+    attribute would silently do nothing.
     """
     middleware = RateLimitMiddleware(
         TokenBucket(rate=10.0, burst=1), per_domain=per_domain
@@ -276,7 +363,7 @@ async def test_middleware_bails_before_sleeping_when_timeout_known() -> None:
     async def handler(req: ClientRequest) -> ClientResponse:
         raise AssertionError("a doomed request must never be sent")
 
-    bucket = middleware._global_limiter
+    bucket = middleware._limiter
     assert isinstance(bucket, TokenBucket)
     assert await bucket.acquire() == 0.0  # drain the burst slot
 
@@ -296,7 +383,7 @@ async def test_middleware_cancel_during_sleep_releases_slot() -> None:
     async def handler(req: ClientRequest) -> ClientResponse:
         raise AssertionError("the cancelled request must never be sent")
 
-    bucket = middleware._global_limiter
+    bucket = middleware._limiter
     assert isinstance(bucket, TokenBucket)
     assert await bucket.acquire() == 0.0  # drain the burst slot
 
@@ -314,7 +401,7 @@ def test_limiter_injection_is_used_directly() -> None:
     """The caller-provided limiter is the one throttling, not a copy of it."""
     bucket = TokenBucket(rate=100.0, burst=1)
     middleware = RateLimitMiddleware(bucket)
-    assert middleware._global_limiter is bucket
+    assert middleware._limiter is bucket
 
 
 def test_non_limiter_rejected() -> None:
@@ -330,7 +417,7 @@ async def test_token_bucket_clone_is_fresh(clock: _FakeClock) -> None:
     await template.acquire()
     assert await template.acquire() > 0.0  # template drained into debt
 
-    fresh = template.clone()
+    fresh = template.clone("example.com")
     assert await fresh.acquire() == 0.0  # full burst again
     assert await fresh.acquire() == 0.0
     assert await fresh.acquire() == pytest.approx(0.1)  # same rate as the template
@@ -355,7 +442,7 @@ class _FixedDelay(RateLimiter):
     async def acquire(self) -> float:
         return self._delay
 
-    def clone(self) -> "_FixedDelay":
+    def clone(self, host: str, /) -> "_FixedDelay":
         return _FixedDelay(self._delay)
 
 
@@ -405,7 +492,7 @@ class _AwaitsToReserve(RateLimiter):
         await asyncio.sleep(0)
         return 0.0
 
-    def clone(self) -> "_AwaitsToReserve":
+    def clone(self, host: str, /) -> "_AwaitsToReserve":
         return _AwaitsToReserve()
 
 
@@ -442,7 +529,7 @@ class _ElapsedAcquire(RateLimiter):
     def release(self) -> None:
         self.releases += 1
 
-    def clone(self) -> "_ElapsedAcquire":
+    def clone(self, host: str, /) -> "_ElapsedAcquire":
         return _ElapsedAcquire(self._clock, self._spend, self._delay)
 
 
@@ -489,7 +576,7 @@ class _CancelledAcquire(RateLimiter):
     def release(self) -> None:
         self.releases += 1
 
-    def clone(self) -> "_CancelledAcquire":
+    def clone(self, host: str, /) -> "_CancelledAcquire":
         return _CancelledAcquire()
 
 
@@ -572,7 +659,7 @@ class _RecordsReleases(RateLimiter):
     def release(self) -> None:
         self.releases += 1
 
-    def clone(self) -> "_RecordsReleases":
+    def clone(self, host: str, /) -> "_RecordsReleases":
         return _RecordsReleases(self._delay, self._error)
 
 
