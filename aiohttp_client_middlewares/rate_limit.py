@@ -48,9 +48,11 @@ class RateLimiter(ABC):
     def clone(self, host: str, /) -> "RateLimiter":
         """Return a fresh limiter, configured the same, scoped to *host*.
 
-        Per-domain mode calls this once per target host, so state (queued
-        slots, accrued tokens) must not carry over. An algorithm that keeps
-        its state in-process can ignore *host*; one that keeps it in a shared
+        Per-domain mode calls this the first time it meets a host, so state
+        (queued slots, accrued tokens) must not carry over. Threads racing on
+        that first contact may each build one and only one is kept, so the
+        call itself should have no side effects. An algorithm that keeps its
+        state in-process can ignore *host*; one that keeps it in a shared
         backend needs it in the key, or every host draws on one limit.
         """
 
@@ -202,10 +204,12 @@ class RateLimitMiddleware:
     ) -> None:
         if not isinstance(limiter, RateLimiter):
             raise TypeError(f"limiter must be a RateLimiter, got {limiter!r}")
-        self._per_domain = per_domain
-        self._template = limiter
-        self._global_limiter: RateLimiter | None = None if per_domain else limiter
-        self._domain_limiters: dict[str, RateLimiter] = {}
+        # The one limiter in global mode; the template to clone in per-domain
+        # mode. Whether the per-host dict exists is what says which.
+        self._limiter = limiter
+        self._domain_limiters: dict[str, RateLimiter] | None = (
+            {} if per_domain else None
+        )
 
     @property
     def per_domain(self) -> bool:
@@ -214,25 +218,24 @@ class RateLimitMiddleware:
         Read-only: which limiter a request gets is decided in ``__init__``,
         so flipping this afterwards could not take effect.
         """
-        return self._per_domain
+        return self._domain_limiters is not None
 
     def _get_limiter(self, request: ClientRequest) -> RateLimiter:
-        if self._global_limiter is not None:
-            return self._global_limiter
+        limiters = self._domain_limiters
+        if limiters is None:
+            return self._limiter
         # aiohttp raises InvalidUrlClientError for host-less URLs before
         # any middleware runs (on redirects too), so ``host`` is only
         # ``None`` in the type; the assert narrows it for mypy.
         domain = request.url.host
         assert domain is not None
-        limiter = self._domain_limiters.get(domain)
+        limiter = limiters.get(domain)
         if limiter is None:
             # setdefault, not an assignment: threads racing for a host they
             # have not seen before must all leave with the limiter that was
             # stored, or each gets a private full budget and the burst
             # allowance is briefly multiplied by the number of racers.
-            limiter = self._domain_limiters.setdefault(
-                domain, self._template.clone(domain)
-            )
+            limiter = limiters.setdefault(domain, self._limiter.clone(domain))
         return limiter
 
     async def __call__(

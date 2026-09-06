@@ -216,32 +216,48 @@ def test_per_domain_uses_distinct_limiters() -> None:
 
     assert limiter_a is not limiter_b  # distinct hosts -> isolated limiters
     assert limiter_a is limiter_a_again  # same host -> same limiter
+    assert middleware._domain_limiters is not None
     assert len(middleware._domain_limiters) == 2
 
 
 class _KeyedByHost(RateLimiter):
-    """A limiter whose state lives under a key, as a Redis-backed one would."""
+    """A limiter whose state lives under a key, as a Redis-backed one would.
 
-    def __init__(self, prefix: str, host: str = "") -> None:
+    Every host it is cloned for is recorded on a list the clones share with
+    their template, so a test can see how often the middleware asks.
+    """
+
+    def __init__(
+        self, prefix: str, host: str = "", clones: list[str] | None = None
+    ) -> None:
         self._prefix = prefix
         self.key = f"{prefix}:{host}" if host else prefix
+        self.clones = [] if clones is None else clones
 
     async def acquire(self) -> float:
         return 0.0
 
     def clone(self, host: str, /) -> "_KeyedByHost":
-        return _KeyedByHost(self._prefix, host)
+        self.clones.append(host)
+        return _KeyedByHost(self._prefix, host, self.clones)
 
 
 def test_clone_is_given_the_host_it_is_built_for() -> None:
-    """A shared backend can only scope per host if clone() is told the host."""
-    middleware = RateLimitMiddleware(_KeyedByHost("rl"), per_domain=True)
+    """A shared backend can only scope per host if clone() is told the host.
+
+    A host seen again gets the stored limiter back without another clone.
+    """
+    template = _KeyedByHost("rl")
+    middleware = RateLimitMiddleware(template, per_domain=True)
 
     a = middleware._get_limiter(_fake_request("a.example"))
     b = middleware._get_limiter(_fake_request("b.example"))
+    a_again = middleware._get_limiter(_fake_request("a.example"))
 
     assert isinstance(a, _KeyedByHost) and isinstance(b, _KeyedByHost)
     assert (a.key, b.key) == ("rl:a.example", "rl:b.example")
+    assert a_again is a
+    assert template.clones == ["a.example", "b.example"]
 
 
 class _BlocksInClone(RateLimiter):
@@ -265,7 +281,9 @@ def test_first_contact_hands_every_racer_the_stored_limiter() -> None:
     Each keeping the one it built would hand every racer a private, full
     budget, multiplying the burst allowance by the number of racers for that
     instant. ``dict.setdefault`` is what makes the winner the one everybody
-    gets; a plain assignment does not.
+    gets; a plain assignment does not. The barrier sits inside ``clone()``,
+    so this also pins that the miss path stays lock-free: every racer builds
+    one and the extra clones are discarded.
     """
     racers = 4
     barrier = threading.Barrier(racers, timeout=10)
@@ -282,6 +300,7 @@ def test_first_contact_hands_every_racer_the_stored_limiter() -> None:
         thread.join(timeout=10)
 
     assert len(handed_out) == racers
+    assert middleware._domain_limiters is not None
     stored = middleware._domain_limiters["new.example"]
     assert all(limiter is stored for limiter in handed_out)
 
@@ -293,7 +312,7 @@ def test_global_mode_shares_one_limiter() -> None:
     limiter_a = middleware._get_limiter(_fake_request("a.example"))
     limiter_b = middleware._get_limiter(_fake_request("b.example"))
 
-    assert limiter_a is limiter_b is middleware._global_limiter
+    assert limiter_a is limiter_b is middleware._limiter
 
 
 @pytest.mark.parametrize("per_domain", (False, True))
@@ -344,7 +363,7 @@ async def test_middleware_bails_before_sleeping_when_timeout_known() -> None:
     async def handler(req: ClientRequest) -> ClientResponse:
         raise AssertionError("a doomed request must never be sent")
 
-    bucket = middleware._global_limiter
+    bucket = middleware._limiter
     assert isinstance(bucket, TokenBucket)
     assert await bucket.acquire() == 0.0  # drain the burst slot
 
@@ -364,7 +383,7 @@ async def test_middleware_cancel_during_sleep_releases_slot() -> None:
     async def handler(req: ClientRequest) -> ClientResponse:
         raise AssertionError("the cancelled request must never be sent")
 
-    bucket = middleware._global_limiter
+    bucket = middleware._limiter
     assert isinstance(bucket, TokenBucket)
     assert await bucket.acquire() == 0.0  # drain the burst slot
 
@@ -382,7 +401,7 @@ def test_limiter_injection_is_used_directly() -> None:
     """The caller-provided limiter is the one throttling, not a copy of it."""
     bucket = TokenBucket(rate=100.0, burst=1)
     middleware = RateLimitMiddleware(bucket)
-    assert middleware._global_limiter is bucket
+    assert middleware._limiter is bucket
 
 
 def test_non_limiter_rejected() -> None:

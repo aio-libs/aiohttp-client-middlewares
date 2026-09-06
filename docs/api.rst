@@ -87,7 +87,9 @@ Rate limiting
    ``acquire()``, which reserves a slot and returns its delay as a non-negative
    finite number of seconds -- ``wait()`` takes that on trust -- and
    ``clone(host)``, which returns a fresh limiter with the same configuration
-   scoped to one host (called once per host by per-domain mode)::
+   scoped to one host (called when per-domain mode first meets a host; a
+   racing thread's extra clone is discarded, so it should have no side
+   effects)::
 
        class RedisLimiter(RateLimiter):
            def __init__(self, redis, key, script):
