@@ -30,6 +30,8 @@ ready-to-use *client* middlewares for ``aiohttp``. It currently provides:
 
 - ``DigestAuthMiddleware`` -- HTTP Digest authentication, vendored from
   aiohttp core; this package is the canonical home for it going forward.
+- ``RateLimitMiddleware`` -- client-side rate limiting with a pluggable
+  algorithm (a token bucket is included) and optional per-domain limiters.
 - ``SSRFMiddleware`` and ``SSRFConnector`` -- server-side request forgery
   protection, refusing any address that is not publicly routable.
 
