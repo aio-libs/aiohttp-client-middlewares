@@ -40,6 +40,8 @@ throttled too):
 
 .. literalinclude:: code/index.py
    :pyobject: rate_limit_example
+   :lines: 2-
+   :dedent:
 
 For SSRF protection, combine the connector (which validates every resolved
 address) with the middleware (which enforces URL-level rules):

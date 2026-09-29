@@ -212,9 +212,10 @@ only layer that can constrain the target when a forward proxy is configured
 
    Loopback, private, link-local, site-local, multicast, reserved,
    unspecified and other non-global addresses are blocked, as are
-   carrier-grade NAT, NAT64, 6to4 and Teredo ranges and the RFC 9637
-   documentation range; IPv4-mapped IPv6 addresses are judged by their
-   embedded IPv4 address. A blocked address raises :exc:`SSRFError`.
+   carrier-grade NAT, NAT64 local-use, 6to4 and Teredo ranges and the RFC
+   9637 documentation range. IPv4-mapped (``::ffff:0:0/96``) and NAT64
+   (``64:ff9b::/96``) addresses are judged, and matched against rules, as
+   the IPv4 address they embed. A blocked address raises :exc:`SSRFError`.
 
    .. note::
       When a forward proxy is configured (``proxy=`` on the request, or
@@ -222,6 +223,13 @@ only layer that can constrain the target when a forward proxy is configured
       *proxy* endpoint is resolved and validated here; the target is resolved
       by the proxy and is never seen. Constrain proxied targets with
       :class:`SSRFMiddleware` and an ``allowlist``.
+
+      A proxy on an internal address is blocked like any other host, so
+      exempt it by hostname; exempting its IP address or network would also
+      exempt every name that resolves into it. The exemption covers that host
+      on every port, so also put the name on the middleware's ``denylist``,
+      which checks request targets and never the proxy, to keep the proxy
+      itself from being requested as a target.
 
    :param exempt_hosts: Entries exempted from blocking, layered on top of the
       default public-only policy. Note this is the *opposite* sense to
@@ -232,7 +240,9 @@ only layer that can constrain the target when a forward proxy is configured
       or CIDR network exempts resolved addresses inside it. Use this to reach
       known-internal services deliberately.
    :type exempt_hosts: iterable of str or None
-   :raises ValueError: for a malformed entry.
+   :raises ValueError: for a malformed entry, which includes an IPv4 address
+      written in any form but dotted-quad (``127.1``, ``2130706433``,
+      ``::ffff:127.0.0.1``).
    :raises TypeError: if a bare string is passed instead of an iterable.
 
    Every other keyword argument is forwarded to
@@ -249,8 +259,7 @@ only layer that can constrain the target when a forward proxy is configured
    host check performed. Non-canonical numeric forms (``0x7f000001``,
    ``2130706433``, ``127.1``, ``0177.0.0.1``) are recognized as addresses
    here too, which matters under a proxy where the connector never sees the
-   target. Note that aiohttp itself rejects most of those forms earlier with
-   :exc:`~aiohttp.InvalidUrlClientError`, not :exc:`SSRFError`.
+   target.
 
    :param allowlist: When given, only requests whose URL host matches one of
       these entries are allowed; ``None`` disables the allowlist, while an
@@ -264,12 +273,15 @@ only layer that can constrain the target when a forward proxy is configured
    :param denylist: Requests whose URL host matches one of these entries are
       rejected. Same entry forms as ``allowlist``; checked first.
    :type denylist: iterable of str or None
-   :param allowed_schemes: URL schemes that may pass. This narrows the set
-      aiohttp already enforces -- it rejects anything outside
-      http/https/ws/wss before middlewares run -- so its practical use is
-      requiring TLS with ``("https",)``.
+   :param allowed_schemes: URL schemes that may pass. aiohttp rejects schemes
+      its connector cannot handle before middlewares run, but
+      :class:`~aiohttp.TCPConnector` handles ``tcp://`` as well as
+      http/https/ws/wss, which the default leaves out. Use
+      ``("https", "wss")`` to require TLS.
    :type allowed_schemes: iterable of str
-   :raises ValueError: for a malformed rule entry.
+   :raises ValueError: for a malformed rule entry, which includes an IPv4
+      address written in any form but dotted-quad (``127.1``,
+      ``2130706433``, ``::ffff:127.0.0.1``).
    :raises TypeError: if a bare string is passed instead of an iterable.
 
 .. function:: is_unsafe_address(address)

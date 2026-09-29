@@ -87,6 +87,7 @@ def _fake_results(*ips: str) -> "list[ResolveResult]":
         "192.88.99.1",  # 6to4 relay anycast (ipaddress reports is_global=True)
         "198.18.0.1",  # benchmarking, not globally routable
         "192.0.2.1",  # TEST-NET-1
+        "192.0.0.8",  # IPv4 dummy address; global to ipaddress before 3.12.4
         "::1",  # IPv6 loopback
         "::",  # IPv6 unspecified
         "fe80::1",  # IPv6 link-local
@@ -95,7 +96,8 @@ def _fake_results(*ips: str) -> "list[ResolveResult]":
         "fec0:0:0:ffff::1",  # historical well-known site-local DNS server
         "fd00:ec2::254",  # AWS IPv6 metadata endpoint (unique-local)
         "ff02::1",  # IPv6 multicast
-        "64:ff9b::808:808",  # NAT64-mapped: routes into an IPv4 translator
+        "64:ff9b::a00:1",  # NAT64 translation of 10.0.0.1
+        "64:ff9b::a9fe:a9fe",  # NAT64 translation of the metadata endpoint
         "64:ff9b:1::1",  # NAT64 local-use
         "2002:808:808::1",  # 6to4: embeds an arbitrary IPv4 address
         "2001::1",  # Teredo: embeds an arbitrary IPv4 address
@@ -103,6 +105,7 @@ def _fake_results(*ips: str) -> "list[ResolveResult]":
         "3fff:0fff:ffff:ffff:ffff:ffff:ffff:ffff",  # RFC 9637 range, upper end
         "::ffff:10.0.0.1",  # IPv4-mapped private
         "::ffff:169.254.169.254",  # IPv4-mapped metadata endpoint
+        "::ffff:192.88.99.1",  # IPv4-mapped: the extra ranges apply after unwrapping
         "not-an-ip-address",  # unparsable input fails closed
     ],
 )
@@ -120,11 +123,45 @@ def test_unsafe_addresses_blocked(address: str) -> None:
         "2606:4700:4700::1111",
         "2600:1901::1",
         "::ffff:8.8.8.8",  # IPv4-mapped *public* address is judged as 8.8.8.8
+        "64:ff9b::808:808",  # NAT64, how an IPv6-only host reaches 8.8.8.8
     ],
 )
 def test_public_addresses_allowed(address: str) -> None:
     """Globally-routable public addresses are not flagged."""
     assert not is_unsafe_address(address)
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "100.64.0.1",
+        "192.0.0.8",
+        "192.88.99.1",
+        "64:ff9b:1::1",
+        "2002:808:808::1",
+        "2001::1",
+        "fec0::1",
+        "3fff::1",
+    ],
+)
+def test_ranges_blocked_even_where_ipaddress_calls_them_global(address: str) -> None:
+    """Older CPython patch releases classify these as global; block them anyway.
+
+    Patching ``ipaddress`` to classify nothing is what makes the test mean the
+    same on every CPython, instead of passing for free on a patched one.
+    """
+    ip = ip_address(address)
+    with mock.patch.multiple(
+        type(ip),
+        is_global=True,
+        is_private=False,
+        is_loopback=False,
+        is_link_local=False,
+        is_multicast=False,
+        is_reserved=False,
+        is_unspecified=False,
+    ):
+        assert is_unsafe_address(ip)
 
 
 @pytest.mark.parametrize(
@@ -168,11 +205,25 @@ async def test_middleware_rejects_disallowed_scheme() -> None:
         await middleware(_fake_request("ftp://example.com/file"), _forbidden_handler)
 
 
+async def test_middleware_rejects_tcp_scheme_that_aiohttp_lets_through() -> None:
+    """``TCPConnector`` accepts ``tcp://``, so only the middleware refuses it."""
+    async with ClientSession(middlewares=(SSRFMiddleware(),)) as session:
+        with pytest.raises(SSRFError, match="scheme 'tcp'"):
+            await session.get("tcp://example.com/")
+
+
 async def test_middleware_custom_schemes() -> None:
     """A custom ``allowed_schemes`` replaces the default set."""
     middleware = SSRFMiddleware(allowed_schemes=("https",))
     with pytest.raises(SSRFError, match="scheme"):
         await middleware(_fake_request("http://example.com/"), _forbidden_handler)
+
+
+async def test_middleware_schemes_are_case_insensitive() -> None:
+    """``"HTTPS"`` means https, since yarl lowercases the URL's scheme."""
+    middleware = SSRFMiddleware(allowed_schemes=("HTTPS",))
+    response = await _middleware_call_ok("https://example.com/", middleware)
+    assert response is not None
 
 
 async def test_middleware_rejects_missing_host() -> None:
@@ -253,6 +304,33 @@ async def test_middleware_allowlist_mode() -> None:
     assert response is not None
     with pytest.raises(SSRFError, match="not on the allowlist"):
         await middleware(_fake_request("http://other.example.com/"), _forbidden_handler)
+
+
+async def test_empty_allowlist_blocks_everything() -> None:
+    """An empty allowlist fails closed rather than disabling the check."""
+    middleware = SSRFMiddleware(allowlist=[])
+    for url in ("http://example.com/", "http://8.8.8.8/"):
+        with pytest.raises(SSRFError, match="not on the allowlist"):
+            await middleware(_fake_request(url), _forbidden_handler)
+
+
+@pytest.mark.parametrize(
+    "host",
+    ["[::ffff:93.184.216.34]", "[64:ff9b::5db8:d822]"],
+    ids=["mapped", "nat64"],
+)
+async def test_ipv4_deny_rule_matches_ipv6_forms(host: str) -> None:
+    """An IPv6 spelling of a denylisted IPv4 address is still denied."""
+    middleware = SSRFMiddleware(denylist=["93.184.216.34"])
+    with pytest.raises(SSRFError, match="denylisted"):
+        await middleware(_fake_request(f"http://{host}/"), _forbidden_handler)
+
+
+async def test_ipv4_allow_rule_matches_mapped_form() -> None:
+    """``[::ffff:10.0.0.1]`` is 10.0.0.1, so an IPv4 allow rule covers it."""
+    middleware = SSRFMiddleware(allowlist=["10.0.0.0/8"])
+    response = await _middleware_call_ok("http://[::ffff:10.0.0.1]/", middleware)
+    assert response is not None
 
 
 async def test_middleware_allowlist_cidr_overrides_unsafe_check() -> None:
@@ -372,6 +450,50 @@ async def test_connector_exempt_network_permits_addresses_inside_it() -> None:
         await connector.close()
 
 
+@pytest.mark.parametrize(
+    "host", ["notinternal.example.com", "internal.example.com.evil.example"]
+)
+async def test_connector_exempt_hostname_is_anchored(host: str) -> None:
+    """An exempt hostname never matches by substring or suffix."""
+    connector = SSRFConnector(exempt_hosts=["internal.example.com"])
+    try:
+        with mock.patch.object(
+            TCPConnector,
+            "_resolve_host",
+            mock.AsyncMock(return_value=_fake_results("10.0.0.5")),
+        ):
+            with pytest.raises(SSRFError, match="10.0.0.5"):
+                await connector._resolve_host(host, 80)
+    finally:
+        await connector.close()
+
+
+async def test_connector_exempt_network_covers_mapped_resolution() -> None:
+    """An IPv4 exemption covers a resolved ``::ffff:`` form of the address."""
+    connector = SSRFConnector(exempt_hosts=["10.0.0.0/8"])
+    results = _fake_results("::ffff:10.0.0.5")
+    try:
+        with mock.patch.object(
+            TCPConnector, "_resolve_host", mock.AsyncMock(return_value=results)
+        ):
+            assert await connector._resolve_host("internal.example.com", 80) == results
+    finally:
+        await connector.close()
+
+
+async def test_connector_forwards_traces_to_resolver() -> None:
+    """``traces`` reaches aiohttp's resolver, so DNS tracing keeps working."""
+    connector = SSRFConnector()
+    traces = [mock.Mock()]
+    resolve = mock.AsyncMock(return_value=_fake_results("93.184.216.34"))
+    try:
+        with mock.patch.object(TCPConnector, "_resolve_host", resolve):
+            await connector._resolve_host("example.com", 80, traces)
+    finally:
+        await connector.close()
+    resolve.assert_awaited_once_with("example.com", 80, traces)
+
+
 def test_resolve_host_override_matches_aiohttp_signature() -> None:
     """Fail loudly if aiohttp changes the ``_resolve_host`` signature."""
     ours = inspect.signature(SSRFConnector._resolve_host)
@@ -397,12 +519,25 @@ def test_resolve_host_override_matches_aiohttp_signature() -> None:
         ["http://victim.example"],  # a URL pasted instead of a host
         ["victim.example:8080"],  # host:port instead of a host
         [""],  # blank line from a config file
+        ["127.1"],  # non-canonical IPv4 would be kept as a hostname
+        ["2130706433"],  # decimal IPv4
+        ["0x7f000001"],  # hex IPv4
+        ["0177.0.0.1"],  # octal IPv4
+        ["127.0.0.1."],  # trailing dot
+        ["::ffff:10.0.0.1"],  # IPv4-mapped: matched as 10.0.0.1, so write that
+        ["64:ff9b::/96"],  # NAT64: likewise matched as IPv4
     ],
 )
 def test_malformed_rule_entry_raises(entries: "list[str]") -> None:
     """A rule that cannot be parsed raises instead of matching nothing."""
     with pytest.raises((ValueError, TypeError)):
         SSRFMiddleware(denylist=entries)
+
+
+@pytest.mark.parametrize("entry", ["1.example.com", "0x7f.example", "::/0"])
+def test_rule_lookalikes_still_parse(entry: str) -> None:
+    """Only the last label makes a name numeric, and ``::/0`` is plain IPv6."""
+    SSRFMiddleware(denylist=[entry])
 
 
 @pytest.mark.parametrize("kwarg", ["allowlist", "denylist"])
@@ -449,9 +584,10 @@ async def test_middleware_blocks_non_canonical_loopback(host: str) -> None:
         await middleware(_fake_request(f"http://{host}/"), _forbidden_handler)
 
 
-async def test_middleware_still_passes_numeric_looking_public_ip() -> None:
+@pytest.mark.parametrize("host", ["134744072", "0x08080808"])
+async def test_middleware_passes_non_canonical_public_ip(host: str) -> None:
     """The non-canonical parser must not block legitimate public addresses."""
-    response = await _middleware_call_ok("http://8.8.8.8/", SSRFMiddleware())
+    response = await _middleware_call_ok(f"http://{host}/", SSRFMiddleware())
     assert response is not None
 
 
