@@ -5,6 +5,8 @@ from aiohttp import ClientSession
 from aiohttp_client_middlewares import (
     DigestAuthMiddleware,
     RateLimitMiddleware,
+    SSRFConnector,
+    SSRFMiddleware,
     TokenBucket,
 )
 
@@ -25,3 +27,13 @@ async def rate_limit_example() -> None:
         async with session.get("http://example.com") as resp:
             resp.raise_for_status()
             print(await resp.text())
+
+
+async def ssrf_example() -> None:
+    # Both layers: the connector judges resolved addresses, the middleware
+    # judges the URL. Neither is sufficient alone.
+    async with ClientSession(
+        connector=SSRFConnector(), middlewares=(SSRFMiddleware(),)
+    ) as session:
+        async with session.get("https://example.com") as resp:
+            print("Status:", resp.status)

@@ -32,6 +32,8 @@ ready-to-use *client* middlewares for ``aiohttp``. It currently provides:
   aiohttp core; this package is the canonical home for it going forward.
 - ``RateLimitMiddleware`` -- client-side rate limiting with a pluggable
   algorithm (a token bucket is included) and optional per-domain limiters.
+- ``SSRFMiddleware`` and ``SSRFConnector`` -- server-side request forgery
+  protection, refusing any address that is not publicly routable.
 
 Middlewares plug into ``aiohttp.ClientSession`` through the client
 middleware API introduced in aiohttp 3.12, so they can wrap every outgoing
