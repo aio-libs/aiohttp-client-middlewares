@@ -305,12 +305,14 @@ Retries
    :exc:`asyncio.TimeoutError` instead of the last response.
 
    Middleware order matters: middlewares listed earlier wrap the ones listed
-   later. List ``RetryMiddleware`` first. A :class:`DigestAuthMiddleware` listed
-   after it then signs every attempt with a fresh nonce count, and a
-   :class:`RateLimitMiddleware` listed last throttles every attempt. Without
-   preemptive authentication (``preemptive=False``), a retry first carries the
-   previous attempt's signature; a server that rejects a repeated nonce count
-   answers 401 once more before the attempt is signed afresh.
+   later. List ``RetryMiddleware`` first. Every retry starts from the headers
+   the request had when it reached ``RetryMiddleware``, as aiohttp's own
+   re-send starts from a fresh request, so what a later middleware changed is
+   not carried over. A :class:`DigestAuthMiddleware` listed after it then signs
+   every attempt with a fresh nonce count, and a :class:`RateLimitMiddleware`
+   listed last throttles every attempt. Without preemptive authentication
+   (``preemptive=False``), a retry is sent unsigned like the first attempt, so
+   the server's challenge costs one more 401 per retry.
 
    A ``Set-Cookie`` header on a response that is retried does not reach the
    session's cookie jar, because aiohttp stores cookies only from the response

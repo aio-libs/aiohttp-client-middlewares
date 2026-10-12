@@ -1374,23 +1374,25 @@ async def test_every_attempt_is_signed_afresh_by_a_later_digest_middleware(
     assert counts == ["00000001", "00000002"]
 
 
-async def test_without_preemptive_auth_a_retry_carries_the_old_signature(
+async def test_without_preemptive_auth_a_retry_is_challenged_afresh(
     aiohttp_client: AiohttpClient,
 ) -> None:
-    """DigestAuthMiddleware signs a retry afresh only once the server has
-    rejected the previous attempt's signature again.
+    """A retry is sent unsigned, as the first attempt was, rather than with
+    the previous attempt's signature, whose nonce count it would repeat.
     """
-    seen: list[tuple[str, int]] = []
+    seen: list[tuple[str | None, int]] = []
 
     async def handle(request: web.Request) -> web.Response:
         auth = request.headers.get("Authorization")
         if auth is None:
+            seen.append((None, 401))
             return web.Response(status=401, headers={"WWW-Authenticate": _CHALLENGE})
         count = auth.split("nc=")[1].split(",")[0]
-        if any(count == seen_count for seen_count, _ in seen):
+        signed = [seen_count for seen_count, _ in seen if seen_count is not None]
+        if count in signed:
             # A repeated nonce count, which RFC 7616 lets a server reject.
             status = 401
-        elif not seen:
+        elif not signed:
             status = 503
         else:
             status = 200
@@ -1408,7 +1410,32 @@ async def test_without_preemptive_auth_a_retry_carries_the_old_signature(
 
     async with client.get("/") as resp:
         assert resp.status == 200
-    assert seen == [("00000001", 503), ("00000001", 401), ("00000002", 200)]
+    assert seen == [(None, 401), ("00000001", 503), (None, 401), ("00000002", 200)]
+
+
+async def test_headers_added_by_a_later_middleware_do_not_pile_up(
+    aiohttp_client: AiohttpClient,
+) -> None:
+    seen: list[list[str]] = []
+
+    async def handle(request: web.Request) -> web.Response:
+        seen.append(request.headers.getall("X-Attempt"))
+        return web.Response(status=503 if len(seen) < 3 else 200)
+
+    async def add_header(
+        request: ClientRequest, handler: ClientHandlerType
+    ) -> ClientResponse:
+        request.headers.add("X-Attempt", "1")
+        return await handler(request)
+
+    app = web.Application()
+    app.router.add_get("/", handle)
+    middlewares = (RetryMiddleware(base_delay=0.0), add_header)
+    client = await aiohttp_client(app, middlewares=middlewares)
+
+    async with client.get("/", headers={"X-Attempt": "0"}) as resp:
+        assert resp.status == 200
+    assert seen == [["0", "1"]] * 3
 
 
 async def test_a_session_closed_during_a_wait_ends_the_request(

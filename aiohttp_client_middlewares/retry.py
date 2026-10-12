@@ -154,6 +154,7 @@ class RetryMiddleware:
     ) -> ClientResponse:
         """Send the request, and send it again while the failure is transient."""
         deadline = _deadline(request)
+        headers = request.headers.copy()
         ceiling = min(self._base_delay, self._max_delay)
         for _ in range(self._attempts - 1):
             try:
@@ -191,6 +192,12 @@ class RetryMiddleware:
                 # AssertionError rather than a ClientError.
                 raise ClientConnectionError("Session is closed")
             ceiling = min(ceiling * 2, self._max_delay)
+            # Each attempt starts from the headers this middleware received,
+            # as aiohttp's own resend starts from a fresh request. A later
+            # middleware may have changed them: DigestAuthMiddleware leaves
+            # its signature behind, and its nonce count must not be reused.
+            request.headers.clear()
+            request.headers.extend(headers)
         # The last attempt's response or exception reaches the caller as is.
         return await handler(request)
 
