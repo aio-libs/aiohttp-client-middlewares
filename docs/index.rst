@@ -10,6 +10,8 @@ This package collects ready-to-use middlewares for
   authentication.
 - :class:`~aiohttp_client_middlewares.RateLimitMiddleware` -- client-side
   token-bucket rate limiting.
+- :class:`~aiohttp_client_middlewares.RetryMiddleware` -- retries after
+  transient failures, with a jittered backoff and ``Retry-After`` support.
 
 
 Installation
@@ -37,6 +39,14 @@ throttled too):
 
 .. literalinclude:: code/index.py
    :pyobject: rate_limit_example
+   :lines: 2-
+   :dedent:
+
+Retries after transient failures (list the retry middleware first, so that
+the middlewares after it, such as the rate limiter, run on every attempt):
+
+.. literalinclude:: code/index.py
+   :pyobject: retry_example
    :lines: 2-
    :dedent:
 

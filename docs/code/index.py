@@ -5,6 +5,7 @@ from aiohttp import ClientSession
 from aiohttp_client_middlewares import (
     DigestAuthMiddleware,
     RateLimitMiddleware,
+    RetryMiddleware,
     TokenBucket,
 )
 
@@ -22,6 +23,18 @@ async def rate_limit_example() -> None:
     # At most 5 requests per second, allowing bursts of up to 2.
     rate_limit = RateLimitMiddleware(TokenBucket(rate=5.0, burst=2))
     async with ClientSession(middlewares=(rate_limit,)) as session:
+        async with session.get("http://example.com") as resp:
+            resp.raise_for_status()
+            print(await resp.text())
+
+
+async def retry_example() -> None:
+    # Listed first, so the rate limiter after it throttles every attempt.
+    middlewares = (
+        RetryMiddleware(),
+        RateLimitMiddleware(TokenBucket(rate=5.0, burst=2)),
+    )
+    async with ClientSession(middlewares=middlewares) as session:
         async with session.get("http://example.com") as resp:
             resp.raise_for_status()
             print(await resp.text())

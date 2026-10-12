@@ -191,3 +191,125 @@ Rate limiting
       :pyobject: rate_limit_usage
       :lines: 2-
       :dedent:
+
+
+Retries
+-------
+
+.. class:: RetryMiddleware(*, attempts=3, \
+              statuses=frozenset({408, 429, 500, 502, 503, 504}), \
+              methods=frozenset({"GET", "HEAD", "OPTIONS", "TRACE", "PUT", "DELETE", "QUERY"}), \
+              base_delay=1.0, max_delay=60.0)
+
+   Client middleware that sends a request again after a transient failure: a
+   connection that could not be opened, a response with a status such as 503,
+   or a response that did not start within the read timeout.
+
+   :param int attempts: How many times this middleware sends a request,
+      including the first time. ``1`` turns its retries off. aiohttp's own
+      re-send after a dropped connection (see below) runs the middlewares again
+      with a fresh count, so a request can be sent up to twice ``attempts``
+      times. Each redirect starts a fresh count too.
+   :param statuses: Response statuses to retry, each from 400 to 599. The
+      default covers a request timeout (408), throttling (429) and the server
+      errors that are usually temporary (500, 502, 503 and 504).
+   :type statuses: ~collections.abc.Collection of int
+   :param methods: Methods that may be sent again once the request may have
+      reached the server: by default the idempotent methods of :rfc:`9110` and
+      ``QUERY``. The set replaces the default one, so list the default methods
+      as well when adding ``POST`` or ``PATCH``, and add those only when the
+      server makes them idempotent, for example with an idempotency key.
+   :type methods: set of str
+   :param float base_delay: Ceiling of the first wait, in seconds. It doubles
+      with every retry. ``0`` sends every retry at once, unless a
+      ``Retry-After`` header asks for a wait.
+   :param float max_delay: Longest wait before any retry, in seconds, including
+      one that a ``Retry-After`` header asks for. ``0`` sends every retry at
+      once and returns any response whose ``Retry-After`` asks for a wait.
+   :raises ValueError: if ``attempts`` is below 1, a status is not from 400 to
+      599, or a delay is negative or not finite.
+   :raises TypeError: if ``attempts`` or a status is not an integer, or
+      ``methods`` is a string or holds anything but strings.
+
+   Whether an outcome is retried depends on whether the request may have
+   reached the server:
+
+   - A connection that could not be opened (:exc:`~aiohttp.ClientConnectorError`,
+     except TLS and certificate errors, and :exc:`~aiohttp.ConnectionTimeoutError`),
+     or that aiohttp found closed before writing the request
+     (:exc:`~aiohttp.ClientConnectionResetError`), is retried for every method:
+     nothing was sent.
+   - A response whose status is in ``statuses``, and a response that sent
+     nothing for ``ClientTimeout.sock_read`` seconds
+     (:exc:`~aiohttp.SocketTimeoutError`), are retried only for ``methods``:
+     the server may already have acted on the request. aiohttp sets no
+     ``sock_read`` by default. Without one, a server that never answers is
+     waited on until the total timeout, which is never retried.
+   - A connection that the server dropped or reset once the request was on its
+     way (:exc:`~aiohttp.ServerDisconnectedError`, :exc:`~aiohttp.ClientOSError`)
+     is left to aiohttp. aiohttp sends a ``GET``, ``HEAD``, ``OPTIONS``,
+     ``TRACE``, ``PUT`` or ``DELETE`` request, and from aiohttp 3.15 a
+     ``QUERY`` request, once more by itself, running the middlewares again, so
+     a server that keeps dropping connections gets two sends rather than twice
+     ``attempts``. Other methods, including any added to ``methods``, are not
+     sent again after a dropped connection. aiohttp's ``TestClient`` turns this
+     re-send off.
+   - Nothing else is retried. TLS and certificate errors, other statuses, the
+     request's total timeout and cancellation reach the caller untouched.
+
+   This middleware sends a request again only when its body can be sent again:
+   no body, or ``bytes``, ``str``, JSON or urlencoded-form data. aiohttp sends
+   a stream that it has already sent as an empty body, without any error, and
+   aiohttp 3.12.0 closes a file after sending it, so this middleware never
+   sends a stream, a file or a multipart body twice. Pass the data as
+   ``bytes`` to make the request retryable. aiohttp's own re-send after a
+   dropped connection has no such check: before aiohttp 3.14.4 it can send a
+   stream or a file again as an empty body. A request sent with
+   ``Expect: 100-continue`` (``expect100=True``) is not sent again either,
+   because aiohttp cannot send its body after a response that came before
+   ``100 Continue``.
+
+   Each retry waits a random time between zero and a ceiling that starts at
+   ``base_delay`` and doubles with every retry, up to ``max_delay`` ("full
+   jitter"). A ``Retry-After`` header, in seconds or as an HTTP date, sets the
+   shortest wait. When it asks for longer than ``max_delay``, the response is
+   returned at once rather than retried before the server is ready. A
+   ``Retry-After`` that is malformed or sent more than once is ignored.
+
+   A response that is about to be retried is released without being read, which
+   closes its connection if its body has not fully arrived. When no attempt is
+   left, the caller gets the last response or exception unchanged.
+   ``raise_for_status``, which aiohttp applies once the middlewares have
+   returned, sees only that response. If the session is closed while a request
+   waits, the request ends with :exc:`~aiohttp.ClientConnectionError` when the
+   wait is over.
+
+   The request's total timeout (``ClientTimeout.total``) covers every attempt
+   and every wait. When aiohttp exposes it to middlewares (aiohttp 3.15 and
+   newer), a wait that would run past it is skipped and the last response or
+   exception is returned at once. :class:`RateLimitMiddleware` raises
+   :exc:`asyncio.TimeoutError` in that situation instead, because it has no
+   response to hand back. The middleware counts the time from when aiohttp
+   calls it, which leaves out earlier redirects and the sends before aiohttp's
+   own re-send; after those, a wait can still end in
+   :exc:`asyncio.TimeoutError`. With older aiohttp versions nothing is checked:
+   keep ``(attempts - 1) * max_delay``, plus the time the attempts themselves
+   take, below the total timeout, or the caller gets
+   :exc:`asyncio.TimeoutError` instead of the last response.
+
+   Middleware order matters: middlewares listed earlier wrap the ones listed
+   later. List ``RetryMiddleware`` first. A :class:`DigestAuthMiddleware` listed
+   after it then signs every attempt with a fresh nonce count (with preemptive
+   authentication, the default), and a :class:`RateLimitMiddleware` listed
+   last throttles every attempt.
+
+   A ``Set-Cookie`` header on a response that is retried does not reach the
+   session's cookie jar, because aiohttp stores cookies only from the response
+   that the middlewares return.
+
+   **Usage**
+
+   .. literalinclude:: code/api.py
+      :pyobject: retry_usage
+      :lines: 2-
+      :dedent:
