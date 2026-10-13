@@ -220,25 +220,29 @@ Retries
       as well when adding ``POST`` or ``PATCH``, and add those only when the
       server makes them idempotent, for example with an idempotency key.
    :type methods: set of str
-   :param float base_delay: Ceiling of the first wait, in seconds. It doubles
-      with every retry. ``0`` sends every retry at once, unless a
-      ``Retry-After`` header asks for a wait.
+   :param float base_delay: Ceiling of the first wait, in seconds, never more
+      than ``max_delay``. It doubles with every retry. ``0`` sends every retry
+      at once, unless a ``Retry-After`` header asks for a wait.
    :param float max_delay: Longest wait before any retry, in seconds, including
       one that a ``Retry-After`` header asks for. ``0`` sends every retry at
       once and returns any response whose ``Retry-After`` asks for a wait.
    :raises ValueError: if ``attempts`` is below 1, a status is not from 400 to
       599, or a delay is negative or not finite.
-   :raises TypeError: if ``attempts`` or a status is not an integer, or
-      ``methods`` is a string or holds anything but strings.
+   :raises TypeError: if ``attempts`` or a status is not an integer, a delay
+      is not a number, or ``methods`` is a string or holds anything but
+      strings.
 
    Whether an outcome is retried depends on whether the request may have
    reached the server:
 
-   - A connection that could not be opened (:exc:`~aiohttp.ClientConnectorError`,
-     except TLS and certificate errors, and :exc:`~aiohttp.ConnectionTimeoutError`),
-     or that aiohttp found closed before writing the request
-     (:exc:`~aiohttp.ClientConnectionResetError`), is retried for every method:
-     nothing was sent.
+   - A connection that could not be opened is retried for every method:
+     nothing reached the server. That is :exc:`~aiohttp.ConnectionTimeoutError`,
+     :exc:`~aiohttp.ClientConnectorError` other than TLS and certificate errors,
+     :exc:`~aiohttp.ClientConnectionResetError` (aiohttp found the connection
+     closed before writing the request) and ``ClientHttpProxyError``
+     with one of ``statuses`` (a proxy refused the ``CONNECT`` of an HTTPS
+     request; the proxy's ``Retry-After`` is not read, and a plain-HTTP request
+     gets the proxy's answer as a response instead).
    - A response whose status is in ``statuses``, and a response that sent
      nothing for ``ClientTimeout.sock_read`` seconds
      (:exc:`~aiohttp.SocketTimeoutError`), are retried only for ``methods``:
@@ -263,8 +267,11 @@ Retries
    aiohttp 3.12.0 closes a file after sending it, so this middleware never
    sends a stream, a file or a multipart body twice. Pass the data as
    ``bytes`` to make the request retryable. aiohttp's own re-send after a
-   dropped connection has no such check: before aiohttp 3.14.4 it can send a
-   stream or a file again as an empty body. A request sent with
+   dropped connection checks the body only from aiohttp 3.14.4, where a file
+   is sent again from the start and a drained stream ends the request with the
+   disconnect error; before 3.14.4 a drained stream or a file is sent again as
+   an empty body (on aiohttp 3.12.0, a file fails with a bare
+   :exc:`ValueError` instead). A request sent with
    ``Expect: 100-continue`` (``expect100=True``) is not sent again either,
    because aiohttp cannot send its body after a response that came before
    ``100 Continue``.
@@ -299,9 +306,11 @@ Retries
 
    Middleware order matters: middlewares listed earlier wrap the ones listed
    later. List ``RetryMiddleware`` first. A :class:`DigestAuthMiddleware` listed
-   after it then signs every attempt with a fresh nonce count (with preemptive
-   authentication, the default), and a :class:`RateLimitMiddleware` listed
-   last throttles every attempt.
+   after it then signs every attempt with a fresh nonce count, and a
+   :class:`RateLimitMiddleware` listed last throttles every attempt. Without
+   preemptive authentication (``preemptive=False``), a retry first carries the
+   previous attempt's signature; a server that rejects a repeated nonce count
+   answers 401 once more before the attempt is signed afresh.
 
    A ``Set-Cookie`` header on a response that is retried does not reach the
    session's cookie jar, because aiohttp stores cookies only from the response

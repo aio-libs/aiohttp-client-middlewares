@@ -8,6 +8,7 @@ import ssl
 import time
 from collections.abc import AsyncIterator, Callable, Collection, Iterator
 from datetime import datetime, timezone
+from decimal import Decimal
 from http import HTTPStatus
 from types import SimpleNamespace
 from typing import cast
@@ -23,6 +24,7 @@ from aiohttp import (
     ClientConnectorError,
     ClientConnectorSSLError,
     ClientHandlerType,
+    ClientHttpProxyError,
     ClientOSError,
     ClientPayloadError,
     ClientRequest,
@@ -80,15 +82,17 @@ def _request(
     return req  # type: ignore[no-any-return]
 
 
-def _response(status: int, *retry_after: str | bytes) -> ClientResponse:
+def _response(
+    status: int, *retry_after: str | bytes, name: bytes = b"Retry-After"
+) -> ClientResponse:
     """A stand-in ``ClientResponse`` with one ``Retry-After`` per argument.
 
-    A ``str`` value is sent as UTF-8, a ``bytes`` one as it is.
+    A ``str`` value is sent as UTF-8, a ``bytes`` one as it is, under ``name``.
     """
     resp = mock.create_autospec(ClientResponse, instance=True)
     resp.status = status
     resp.raw_headers = tuple(
-        (b"Retry-After", value.encode() if isinstance(value, str) else value)
+        (name, value.encode() if isinstance(value, str) else value)
         for value in retry_after
     )
     return resp  # type: ignore[no-any-return]
@@ -309,6 +313,7 @@ _RETRIED_FOR_EVERY_METHOD: list[Callable[[], BaseException]] = [
     lambda: ClientConnectorDNSError(mock.Mock(), OSError(8, "nodename nor servname")),
     lambda: ConnectionTimeoutError("Connection timeout to host"),
     lambda: ClientConnectionResetError("Cannot write to closing transport"),
+    lambda: ClientHttpProxyError(mock.Mock(), (), status=503),
 ]
 _RETRIED_FOR_LISTED_METHODS: list[Callable[[], BaseException]] = [
     lambda: SocketTimeoutError("Timeout on reading data from socket"),
@@ -406,6 +411,17 @@ async def test_other_errors_are_raised_at_once(
     assert type(excinfo.value) is type(error())
     assert handler.calls == 1
     assert sleeps == []
+
+
+async def test_a_proxy_status_outside_statuses_is_raised(sleeps: list[float]) -> None:
+    """407 asks for proxy credentials, which a retry would not supply."""
+    handler = _Handler(
+        ClientHttpProxyError(mock.Mock(), (), status=407), _response(200)
+    )
+
+    with pytest.raises(ClientHttpProxyError):
+        await RetryMiddleware()(_request(), handler)
+    assert handler.calls == 1
 
 
 async def test_cancellation_from_the_handler_is_not_caught(
@@ -700,6 +716,12 @@ def test_no_retry_after(clock: _FakeClock) -> None:
     assert retry._retry_after(_response(503)) is None
 
 
+@pytest.mark.parametrize("name", [b"retry-after", b"RETRY-AFTER"])
+def test_the_header_name_is_matched_in_any_case(name: bytes, clock: _FakeClock) -> None:
+    """``raw_headers`` keeps the case the server sent."""
+    assert retry._retry_after(_response(503, "30", name=name)) == 30.0
+
+
 async def test_retry_after_is_the_shortest_wait(
     sleeps: list[float], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -797,6 +819,7 @@ async def test_a_wait_past_the_total_timeout_returns_the_response(
 
     assert await RetryMiddleware()(request, handler) is response
     assert sleeps == []
+    assert _releases(response) == 0
 
 
 async def test_a_wait_within_the_total_timeout_is_kept(
@@ -818,6 +841,7 @@ async def test_time_spent_sending_counts_against_the_total_timeout(
 
     assert await RetryMiddleware()(request, handler) is response
     assert sleeps == []
+    assert _releases(response) == 0
 
 
 async def test_one_deadline_spans_every_attempt_and_wait(
@@ -839,6 +863,7 @@ async def test_one_deadline_spans_every_attempt_and_wait(
 
     assert await RetryMiddleware()(request, handler) is second
     assert waits == [5.0]
+    assert _releases(second) == 0
 
 
 async def test_an_error_is_raised_rather_than_waiting_past_the_total_timeout(
@@ -852,6 +877,24 @@ async def test_an_error_is_raised_rather_than_waiting_past_the_total_timeout(
 
     assert handler.calls == 1
     assert sleeps == []
+
+
+@pytest.mark.parametrize(
+    "first", [_connector_error, lambda: _response(503)], ids=["error", "response"]
+)
+async def test_the_drawn_wait_is_checked_against_the_total_timeout(
+    first: Callable[[], ClientResponse | BaseException],
+    clock: _FakeClock,
+    sleeps: list[float],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Not its ceiling: a short draw under a tall ceiling still fits."""
+    monkeypatch.setattr(retry, "random", SimpleNamespace(uniform=lambda a, b: 0.0))
+    handler = _Handler(first(), _response(200))
+    request = _request(timeout=ClientTimeout(total=3.0))
+
+    assert (await RetryMiddleware(base_delay=5.0)(request, handler)).status == 200
+    assert sleeps == [0.0]
 
 
 @pytest.mark.parametrize("total", [None, 0.0, -1.0])
@@ -890,7 +933,7 @@ def test_attempts_below_one_are_rejected(attempts: int) -> None:
 @pytest.mark.parametrize("attempts", [2.5, float("inf"), "3"])
 def test_non_integer_attempts_are_rejected(attempts: object) -> None:
     """``inf`` must not mean "retry forever"."""
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match="attempts"):
         RetryMiddleware(attempts=attempts)  # type: ignore[arg-type]
 
 
@@ -913,7 +956,7 @@ async def test_statuses_from_400_to_599_are_accepted(
 @pytest.mark.parametrize("status", [503.5, "503"])
 def test_non_integer_statuses_are_rejected(status: object) -> None:
     """503.5 would never match a response."""
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match="statuses"):
         RetryMiddleware(statuses={status})  # type: ignore[arg-type]
 
 
@@ -940,21 +983,33 @@ def test_a_string_of_methods_is_rejected() -> None:
 @pytest.mark.parametrize("method", [b"GET", 1])
 def test_non_string_methods_are_rejected(method: object) -> None:
     """A bytes method would never match aiohttp's ``str`` one."""
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match="methods"):
         RetryMiddleware(methods={method})  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize(
-    "build",
-    [lambda v: RetryMiddleware(base_delay=v), lambda v: RetryMiddleware(max_delay=v)],
-    ids=["base_delay", "max_delay"],
-)
+_DELAY_BUILDERS: list[Callable[[float], RetryMiddleware]] = [
+    lambda v: RetryMiddleware(base_delay=v),
+    lambda v: RetryMiddleware(max_delay=v),
+]
+
+
+@pytest.mark.parametrize("build", _DELAY_BUILDERS, ids=["base_delay", "max_delay"])
 @pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf")])
 def test_delays_must_be_finite_and_not_negative(
     build: Callable[[float], RetryMiddleware], value: float
 ) -> None:
     with pytest.raises(ValueError, match="_delay must be a finite number"):
         build(value)
+
+
+@pytest.mark.parametrize("build", _DELAY_BUILDERS, ids=["base_delay", "max_delay"])
+@pytest.mark.parametrize("value", [Decimal("1"), "1"], ids=["Decimal", "str"])
+def test_delays_must_be_numbers(
+    build: Callable[[float], RetryMiddleware], value: object
+) -> None:
+    """A Decimal would pass the range check and fail at the first retry."""
+    with pytest.raises(TypeError, match="_delay must be a number"):
+        build(value)  # type: ignore[arg-type]
 
 
 def test_middleware_is_hashable_by_identity() -> None:
@@ -1057,6 +1112,27 @@ async def test_a_retried_response_is_released_unread(
     assert sends == 2
 
 
+async def test_a_retried_response_that_has_arrived_keeps_its_connection(
+    aiohttp_client: AiohttpClient,
+) -> None:
+    """Its connection goes back to the pool, and the retry goes out on it."""
+    peers: list[object] = []
+
+    async def handle(request: web.Request) -> web.Response:
+        assert request.transport is not None
+        peers.append(request.transport.get_extra_info("peername"))
+        return web.Response(status=503 if len(peers) == 1 else 200)
+
+    app = web.Application()
+    app.router.add_get("/", handle)
+    client = await aiohttp_client(app, middlewares=(RetryMiddleware(base_delay=0.0),))
+
+    async with client.get("/") as resp:
+        assert resp.status == 200
+    assert len(peers) == 2
+    assert peers[0] == peers[1]
+
+
 async def test_bytes_bodies_are_sent_again_unchanged(
     aiohttp_client: AiohttpClient,
 ) -> None:
@@ -1145,6 +1221,86 @@ async def test_a_request_rejected_before_100_continue_is_not_sent_again(
     assert rejected == 1
 
 
+@pytest.mark.parametrize(("method", "sends"), [("GET", 2), ("POST", 1)])
+async def test_a_read_timeout_is_retried_for_listed_methods(
+    method: str, sends: int, aiohttp_client: AiohttpClient
+) -> None:
+    """A real ``sock_read`` timeout: the server sends nothing for the first
+    request. The request was sent, so only ``methods`` are retried.
+    """
+    calls = 0
+
+    async def handle(request: web.Request) -> web.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await asyncio.Event().wait()  # cancelled when the client disconnects
+        return web.Response(text="OK")
+
+    app = web.Application(handler_args={"handler_cancellation": True})
+    app.router.add_route("*", "/", handle)
+    counter = _CountSends()
+    client = await aiohttp_client(
+        app, middlewares=(RetryMiddleware(base_delay=0.0), counter)
+    )
+    timeout = ClientTimeout(total=5.0, sock_read=0.5)
+
+    if method == "GET":
+        async with client.get("/", timeout=timeout) as resp:
+            assert resp.status == 200
+    else:
+        with pytest.raises(SocketTimeoutError):
+            await client.post("/", timeout=timeout)
+    assert counter.sends == sends
+
+
+async def test_each_redirect_starts_a_fresh_count(
+    aiohttp_client: AiohttpClient,
+) -> None:
+    """aiohttp runs the middlewares again for the redirected request."""
+
+    async def redirect(request: web.Request) -> web.Response:
+        raise web.HTTPFound("/other")
+
+    async def other(request: web.Request) -> web.Response:
+        return web.Response(status=503)
+
+    app = web.Application()
+    app.router.add_get("/", redirect)
+    app.router.add_get("/other", other)
+    counter = _CountSends()
+    client = await aiohttp_client(
+        app, middlewares=(RetryMiddleware(base_delay=0.0), counter)
+    )
+
+    async with client.get("/") as resp:
+        assert resp.status == 503
+    assert counter.sends == 4
+
+
+async def test_cookies_of_a_retried_response_are_not_stored(
+    aiohttp_client: AiohttpClient,
+) -> None:
+    """aiohttp stores cookies only from the response the middlewares return."""
+    calls = 0
+
+    async def handle(request: web.Request) -> web.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return web.Response(status=503, headers={"Set-Cookie": "retried=1"})
+        return web.Response(text="OK", headers={"Set-Cookie": "final=1"})
+
+    app = web.Application()
+    app.router.add_get("/", handle)
+    client = await aiohttp_client(app, middlewares=(RetryMiddleware(base_delay=0.0),))
+
+    async with client.get("/") as resp:
+        assert resp.status == 200
+    cookies = client.session.cookie_jar.filter_cookies(client.make_url("/"))
+    assert list(cookies) == ["final"]
+
+
 async def test_raise_for_status_sees_only_the_final_response(
     aiohttp_client: AiohttpClient,
 ) -> None:
@@ -1192,6 +1348,9 @@ async def test_every_attempt_goes_through_a_later_rate_limiter(
     assert limiter.acquired == 3
 
 
+_CHALLENGE = 'Digest realm="test", nonce="abc123", qop="auth", algorithm=MD5'
+
+
 async def test_every_attempt_is_signed_afresh_by_a_later_digest_middleware(
     aiohttp_client: AiohttpClient,
 ) -> None:
@@ -1201,8 +1360,7 @@ async def test_every_attempt_is_signed_afresh_by_a_later_digest_middleware(
     async def handle(request: web.Request) -> web.Response:
         auth = request.headers.get("Authorization")
         if auth is None:
-            challenge = 'Digest realm="test", nonce="abc123", qop="auth", algorithm=MD5'
-            return web.Response(status=401, headers={"WWW-Authenticate": challenge})
+            return web.Response(status=401, headers={"WWW-Authenticate": _CHALLENGE})
         counts.append(auth.split("nc=")[1].split(",")[0])
         return web.Response(status=503 if len(counts) == 1 else 200)
 
@@ -1214,6 +1372,43 @@ async def test_every_attempt_is_signed_afresh_by_a_later_digest_middleware(
     async with client.get("/") as resp:
         assert resp.status == 200
     assert counts == ["00000001", "00000002"]
+
+
+async def test_without_preemptive_auth_a_retry_carries_the_old_signature(
+    aiohttp_client: AiohttpClient,
+) -> None:
+    """DigestAuthMiddleware signs a retry afresh only once the server has
+    rejected the previous attempt's signature again.
+    """
+    seen: list[tuple[str, int]] = []
+
+    async def handle(request: web.Request) -> web.Response:
+        auth = request.headers.get("Authorization")
+        if auth is None:
+            return web.Response(status=401, headers={"WWW-Authenticate": _CHALLENGE})
+        count = auth.split("nc=")[1].split(",")[0]
+        if any(count == seen_count for seen_count, _ in seen):
+            # A repeated nonce count, which RFC 7616 lets a server reject.
+            status = 401
+        elif not seen:
+            status = 503
+        else:
+            status = 200
+        seen.append((count, status))
+        headers = {"WWW-Authenticate": _CHALLENGE} if status == 401 else None
+        return web.Response(status=status, headers=headers)
+
+    app = web.Application()
+    app.router.add_get("/", handle)
+    middlewares = (
+        RetryMiddleware(base_delay=0.0),
+        DigestAuthMiddleware("u", "p", preemptive=False),
+    )
+    client = await aiohttp_client(app, middlewares=middlewares)
+
+    async with client.get("/") as resp:
+        assert resp.status == 200
+    assert seen == [("00000001", 503), ("00000001", 401), ("00000002", 200)]
 
 
 async def test_a_session_closed_during_a_wait_ends_the_request(
@@ -1248,6 +1443,54 @@ async def test_a_refused_connection_is_retried(method: str) -> None:
             await session.request(method, url)
 
     assert counter.sends == 3
+
+
+@pytest.mark.parametrize(
+    ("scheme", "method", "sends"),
+    [
+        ("http", "GET", 3),
+        ("http", "POST", 1),
+        ("https", "GET", 3),
+        ("https", "POST", 3),
+    ],
+)
+async def test_a_proxy_answering_503(scheme: str, method: str, sends: int) -> None:
+    """To a plain-HTTP request the proxy's 503 is a response, with the method
+    rule. To the ``CONNECT`` of an HTTPS request it is an error, and the origin
+    saw nothing.
+    """
+    seen: list[bytes] = []
+    answer = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"
+
+    async def proxy(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            while True:
+                head = await reader.readuntil(b"\r\n\r\n")
+                seen.append(head.split(b" ", 1)[0])
+                writer.write(answer)
+                await writer.drain()
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(proxy, "127.0.0.1", 0)
+    proxy_url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+    url = f"{scheme}://example.invalid/"
+    middlewares = (RetryMiddleware(base_delay=0.0),)
+    try:
+        async with aiohttp.ClientSession(middlewares=middlewares) as session:
+            if scheme == "http":
+                async with session.request(method, url, proxy=proxy_url) as resp:
+                    assert resp.status == 503
+            else:
+                with pytest.raises(ClientHttpProxyError) as info:
+                    await session.request(method, url, proxy=proxy_url)
+                assert info.value.status == 503
+    finally:
+        server.close()
+        await server.wait_closed()
+    assert seen == [b"CONNECT" if scheme == "https" else method.encode()] * sends
 
 
 @pytest.mark.parametrize(("method", "sends"), [("GET", 2), ("POST", 1)])
@@ -1307,10 +1550,11 @@ async def test_aiohttp_s_own_resend_starts_a_fresh_count(
     assert sends == 6
 
 
+@pytest.mark.parametrize("name", ["Retry-After", "retry-after"])
 async def test_retry_after_from_a_server_is_honoured(
-    aiohttp_client: AiohttpClient, sleeps: list[float]
+    name: str, aiohttp_client: AiohttpClient, sleeps: list[float]
 ) -> None:
-    server = _Server(429, 200, headers={"Retry-After": "2"})
+    server = _Server(429, 200, headers={name: "2"})
     client = await aiohttp_client(
         server.app(), middlewares=(RetryMiddleware(base_delay=0.0),)
     )

@@ -24,6 +24,7 @@ from aiohttp import (
     ClientConnectorError,
     ClientError,
     ClientHandlerType,
+    ClientHttpProxyError,
     ClientRequest,
     ClientResponse,
     ClientSSLError,
@@ -47,11 +48,12 @@ class RetryMiddleware:
     Whether an outcome is retried depends on whether the request may have
     reached the server:
 
-    - A connection that could not be opened (``ClientConnectorError``, except
-      TLS and certificate errors, and ``ConnectionTimeoutError``), or that
-      aiohttp found closed before writing the request
-      (``ClientConnectionResetError``), is retried for every method: nothing
-      was sent.
+    - A connection that could not be opened (``ConnectionTimeoutError``, and
+      ``ClientConnectorError`` other than TLS and certificate errors), a
+      proxy that answered ``CONNECT`` with one of ``statuses``
+      (``ClientHttpProxyError``), or a connection that aiohttp found closed
+      before writing the request (``ClientConnectionResetError``), is retried
+      for every method: nothing reached the server.
     - A response whose status is in ``statuses``, and a response that sent
       nothing for ``ClientTimeout.sock_read`` seconds
       (``SocketTimeoutError``), are retried only for ``methods``: the server
@@ -88,8 +90,9 @@ class RetryMiddleware:
         including one asked for by ``Retry-After``.
     :raises ValueError: if ``attempts`` is below 1, a status is not from 400
         to 599, or a delay is negative or not finite.
-    :raises TypeError: if ``attempts`` or a status is not an integer, or
-        ``methods`` is a string or holds anything but strings.
+    :raises TypeError: if ``attempts`` or a status is not an integer, a
+        delay is not a number, or ``methods`` is a string or holds anything
+        but strings.
     """
 
     def __init__(
@@ -103,27 +106,46 @@ class RetryMiddleware:
     ) -> None:
         # operator.index() refuses floats: inf cannot mean "retry forever",
         # and 503.5 cannot be a status that never matches.
-        self._attempts = operator.index(attempts)
+        try:
+            self._attempts = operator.index(attempts)
+        except TypeError:
+            raise TypeError(f"attempts must be an integer, got {attempts!r}") from None
         if self._attempts < 1:
             raise ValueError(f"attempts must be >= 1, got {attempts!r}")
-        self._statuses = frozenset(map(operator.index, statuses))
-        for status in self._statuses:
-            # 1xx responses never reach a middleware, and aiohttp follows
+        checked: set[int] = set()
+        for status in statuses:
+            try:
+                code = operator.index(status)
+            except TypeError:
+                raise TypeError(
+                    f"statuses must hold integers, got {status!r}"
+                ) from None
+            # Only 4xx and 5xx can be transient: aiohttp consumes 1xx itself
+            # (a 101 reaches the chain only through ws_connect), and follows
             # redirects only once the chain has returned the 3xx.
-            if not 400 <= status <= 599:
+            if not 400 <= code <= 599:
                 raise ValueError(f"statuses must be from 400 to 599, got {status!r}")
+            checked.add(code)
+        self._statuses = frozenset(checked)
         # Checked for callers without a type checker: frozenset("GET") is
-        # {"G", "E", "T"}, which would silently turn every retry off. So would
-        # a bytes method, which str.upper() refuses below.
+        # {"G", "E", "T"}, which would silently turn off every retry that
+        # depends on the method. So would a bytes method.
         if isinstance(cast(object, methods), str):
             raise TypeError(f"methods must be a set of strings, got {methods!r}")
+        for method in methods:
+            if not isinstance(cast(object, method), str):
+                raise TypeError(f"methods must hold strings, got {method!r}")
         # aiohttp upper-cases ClientRequest.method, so compare in upper case.
-        self._methods = frozenset(map(str.upper, methods))
+        self._methods = frozenset(method.upper() for method in methods)
         for name, delay in (("base_delay", base_delay), ("max_delay", max_delay)):
+            # A Decimal would pass isfinite() and fail the arithmetic on the
+            # first retry instead, outside __init__.
+            if not isinstance(cast(object, delay), (int, float)):
+                raise TypeError(f"{name} must be a number, got {delay!r}")
             if not math.isfinite(delay) or delay < 0:
                 raise ValueError(f"{name} must be a finite number >= 0, got {delay!r}")
-        self._base_delay = base_delay
-        self._max_delay = max_delay
+        self._base_delay = float(base_delay)
+        self._max_delay = float(max_delay)
 
     async def __call__(
         self,
@@ -174,8 +196,9 @@ class RetryMiddleware:
 
     def _is_transient(self, request: ClientRequest, exc: ClientError) -> bool:
         if isinstance(exc, ClientSSLError):
-            # A subclass of ClientConnectorError, but a TLS or certificate
-            # failure fails the same way every time.
+            # A subclass of ClientConnectorError. Most TLS and certificate
+            # failures are permanent (a bad certificate, a protocol mismatch),
+            # and a retry would only repeat the handshake.
             return False
         if isinstance(
             exc,
@@ -185,6 +208,11 @@ class RetryMiddleware:
             # aiohttp found it closed before writing the request. A reset
             # while the body is being written is a ClientOSError instead.
             return True
+        if isinstance(exc, ClientHttpProxyError):
+            # The proxy refused to open the tunnel for an HTTPS request, so
+            # the origin saw nothing. A plain-HTTP request gets the proxy's
+            # answer as a response instead, which follows the status rules.
+            return exc.status in self._statuses
         if isinstance(exc, SocketTimeoutError):
             # The request was sent and may have been acted on.
             return request.method in self._methods
@@ -282,8 +310,9 @@ def _deadline(request: ClientRequest) -> float | None:
     aiohttp arms the timeout once per session request and calls the
     middlewares again for every redirect and for its own re-send after a
     dropped connection, so a later call misses the time already spent. The
-    first call can be up to a second early instead: aiohttp rounds a total of
-    5 s or more up to a whole second.
+    first call can be up to a second early instead: aiohttp rounds its
+    deadline up to a whole second when the total is at least
+    ``ClientTimeout.ceil_threshold`` (5 s by default).
     """
     client_timeout: ClientTimeout | None = getattr(request, "timeout", None)
     total = None if client_timeout is None else client_timeout.total
@@ -296,7 +325,7 @@ def _deadline(request: ClientRequest) -> float | None:
 def _ends_too_late(deadline: float | None, delay: float) -> bool:
     """Whether waiting ``delay`` seconds would run into the total timeout.
 
-    Waiting would only end in ``asyncio.TimeoutError``, so the outcome in
-    hand is handed back instead.
+    Waiting would end in ``asyncio.TimeoutError``, give or take aiohttp's
+    rounding of its deadline, so the outcome in hand is handed back instead.
     """
     return deadline is not None and time.monotonic() + delay >= deadline
