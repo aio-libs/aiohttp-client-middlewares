@@ -7,7 +7,7 @@ server-side request forgery (SSRF) protection.
 
 from .digest_auth import DigestAuthMiddleware
 from .rate_limit import RateLimiter, RateLimitMiddleware, TokenBucket
-from .ssrf import SSRFConnector, SSRFError, SSRFMiddleware, is_unsafe_address
+from .ssrf import SSRFConnector, SSRFError, is_unsafe_address
 
 __version__ = "0.1.0"
 
@@ -17,7 +17,6 @@ __all__ = (
     "RateLimitMiddleware",
     "SSRFConnector",
     "SSRFError",
-    "SSRFMiddleware",
     "TokenBucket",
     "is_unsafe_address",
 )

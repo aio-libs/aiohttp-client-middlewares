@@ -10,9 +10,9 @@ This package collects ready-to-use middlewares for
   authentication.
 - :class:`~aiohttp_client_middlewares.RateLimitMiddleware` -- client-side
   token-bucket rate limiting.
-- :class:`~aiohttp_client_middlewares.SSRFMiddleware`, paired with the
-  :class:`~aiohttp_client_middlewares.SSRFConnector` it requires -- server-side
-  request forgery (SSRF) protection.
+- :class:`~aiohttp_client_middlewares.SSRFConnector` -- server-side request
+  forgery (SSRF) protection. It is a connector rather than a middleware, so
+  that it sees what hostnames resolve to and no request can skip it.
 
 
 Installation
@@ -43,8 +43,7 @@ throttled too):
    :lines: 2-
    :dedent:
 
-For SSRF protection, combine the connector (which validates every resolved
-address) with the middleware (which enforces URL-level rules):
+For SSRF protection, pass the connector to the session:
 
 .. literalinclude:: code/index.py
    :pyobject: ssrf_example
