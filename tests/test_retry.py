@@ -77,6 +77,8 @@ def _request(
     req.body = body
     req.headers = CIMultiDict()
     req.url = URL("http://example.com/")
+    req.chunked = None
+    req.compress = None
     req.session = SimpleNamespace(closed=False)
     req.timeout = ClientTimeout(total=None) if timeout is None else timeout
     return req  # type: ignore[no-any-return]
@@ -1436,6 +1438,125 @@ async def test_headers_added_by_a_later_middleware_do_not_pile_up(
     async with client.get("/", headers={"X-Attempt": "0"}) as resp:
         assert resp.status == 200
     assert seen == [["0", "1"]] * 3
+
+
+class _Envelope(BytesPayload):
+    """A body that a later middleware has already wrapped."""
+
+
+async def test_a_body_a_later_middleware_replaced_is_replaced_afresh(
+    aiohttp_client: AiohttpClient,
+) -> None:
+    """Each retry starts from the body this middleware received, so a later
+    middleware that wraps it once wraps it again, under a matching
+    Content-Length, rather than having its body cut to the old length.
+    """
+    server = _Server(503, 200)
+
+    async def wrap_once(
+        request: ClientRequest, handler: ClientHandlerType
+    ) -> ClientResponse:
+        body = request.body
+        if not isinstance(body, _Envelope):
+            assert isinstance(body, BytesPayload)
+            wrapped = _Envelope(b"[" + bytes(body._value) + b"]")
+            update_body = getattr(request, "update_body", None)
+            if update_body is None:  # pragma: no cover  # aiohttp 3.12.0
+                request.body = wrapped
+                request.headers["Content-Length"] = str(wrapped.size)
+            else:
+                await update_body(wrapped)
+        return await handler(request)
+
+    middlewares = (RetryMiddleware(base_delay=0.0), wrap_once)
+    client = await aiohttp_client(server.app(), middlewares=middlewares)
+
+    async with client.put("/", data=b"order") as resp:
+        assert resp.status == 200
+    assert server.bodies == [b"[order]"] * 2
+
+
+async def test_a_url_a_later_middleware_changed_is_changed_afresh(
+    aiohttp_client: AiohttpClient,
+) -> None:
+    """A query-signing middleware listed after this one signs each attempt
+    once, rather than adding its parameter again on every retry.
+    """
+    queries: list[str] = []
+
+    async def handle(request: web.Request) -> web.Response:
+        queries.append(request.query_string)
+        return web.Response(status=503 if len(queries) == 1 else 200)
+
+    async def sign(
+        request: ClientRequest, handler: ClientHandlerType
+    ) -> ClientResponse:
+        request.url = request.url.extend_query(sig=str(len(request.url.query)))
+        return await handler(request)
+
+    app = web.Application()
+    app.router.add_get("/", handle)
+    middlewares = (RetryMiddleware(base_delay=0.0), sign)
+    client = await aiohttp_client(app, middlewares=middlewares)
+
+    async with client.get("/", params={"a": "1"}) as resp:
+        assert resp.status == 200
+    assert queries == ["a=1&sig=1"] * 2
+
+
+async def test_without_update_body_a_replaced_body_is_put_back(
+    sleeps: list[float],
+) -> None:
+    """aiohttp 3.12.0 has no ``update_body()``: ``body`` is a plain attribute."""
+    original = BytesPayload(b"original")
+    request = _request(body=original)
+    delattr(request, "update_body")
+    seen: list[object] = []
+
+    def replace_body() -> None:
+        seen.append(request.body)
+        request.body = BytesPayload(b"replaced")
+
+    handler = _Handler(_response(503), _response(200), on_call=replace_body)
+
+    assert (await RetryMiddleware()(request, handler)).status == 200
+    assert seen == [original, original]
+
+
+async def test_a_retry_through_a_proxy_keeps_its_credentials() -> None:
+    """aiohttp before 3.13.3 adds Proxy-Authorization to a plain-HTTP request
+    only when it opens a proxy connection, so a retry on a pooled one would
+    go out without it and get a 407 (aio-libs/aiohttp#2596).
+    """
+    statuses = [503, 503]
+    authorized: list[bool] = []
+
+    async def proxy(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            while True:
+                head = await reader.readuntil(b"\r\n\r\n")
+                ok = b"\r\nproxy-authorization: basic " in head.lower()
+                authorized.append(ok)
+                status = (statuses.pop(0) if statuses else 200) if ok else 407
+                writer.write(b"HTTP/1.1 %d X\r\nContent-Length: 0\r\n\r\n" % status)
+                await writer.drain()
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(proxy, "127.0.0.1", 0)
+    proxy_url = f"http://user:pass@127.0.0.1:{server.sockets[0].getsockname()[1]}"
+    middlewares = (RetryMiddleware(base_delay=0.0),)
+    try:
+        async with aiohttp.ClientSession(middlewares=middlewares) as session:
+            url = "http://example.invalid/"
+            async with session.get(url, proxy=proxy_url) as resp:
+                assert resp.status == 200
+    finally:
+        server.close()
+        await server.wait_closed()
+    assert authorized == [True] * 3
 
 
 async def test_a_session_closed_during_a_wait_ends_the_request(

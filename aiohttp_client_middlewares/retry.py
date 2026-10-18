@@ -155,6 +155,8 @@ class RetryMiddleware:
         """Send the request, and send it again while the failure is transient."""
         deadline = _deadline(request)
         headers = request.headers.copy()
+        url, body = request.url, request.body
+        chunked, compress = request.chunked, request.compress
         ceiling = min(self._base_delay, self._max_delay)
         for _ in range(self._attempts - 1):
             try:
@@ -164,7 +166,9 @@ class RetryMiddleware:
                 # be opened: a middleware listed after this one may already
                 # have sent it within the same attempt, as DigestAuthMiddleware
                 # does after a 401.
-                if not (_can_resend(request) and self._is_transient(request, exc)):
+                if not (
+                    _can_resend(request, body) and self._is_transient(request, exc)
+                ):
                     raise
                 delay = random.uniform(0.0, ceiling)
                 if _ends_too_late(deadline, delay):
@@ -172,7 +176,7 @@ class RetryMiddleware:
             else:
                 try:
                     retry_delay = self._retry_delay(
-                        request, response, ceiling, deadline
+                        request, body, response, ceiling, deadline
                     )
                 except BaseException:
                     # aiohttp only cleans up a response the chain returns;
@@ -192,12 +196,29 @@ class RetryMiddleware:
                 # AssertionError rather than a ClientError.
                 raise ClientConnectionError("Session is closed")
             ceiling = min(ceiling * 2, self._max_delay)
-            # Each attempt starts from the headers this middleware received,
-            # as aiohttp's own resend starts from a fresh request. A later
-            # middleware may have changed them: DigestAuthMiddleware leaves
-            # its signature behind, and its nonce count must not be reused.
+            # Each attempt starts from the request this middleware received.
+            # A later middleware may have changed it: DigestAuthMiddleware
+            # leaves its signature behind, and a body or URL rewritten once
+            # would otherwise be rewritten again or sent under stale headers.
+            # aiohttp before 3.13.3 adds Proxy-Authorization to a plain-HTTP
+            # request only when it opens a proxy connection, so a retry on a
+            # pooled one would go out without it (aio-libs/aiohttp#2596).
+            proxy_auth = request.headers.get(hdrs.PROXY_AUTHORIZATION)
+            request.url = url
+            if request.body is not body:
+                update_body = getattr(request, "update_body", None)
+                if update_body is None:  # aiohttp 3.12.0: a plain attribute
+                    request.body = body
+                else:
+                    await update_body(body)
+            request.chunked, request.compress = chunked, compress
             request.headers.clear()
             request.headers.extend(headers)
+            if (
+                proxy_auth is not None
+                and hdrs.PROXY_AUTHORIZATION not in request.headers
+            ):
+                request.headers[hdrs.PROXY_AUTHORIZATION] = proxy_auth
         # The last attempt's response or exception reaches the caller as is.
         return await handler(request)
 
@@ -228,6 +249,7 @@ class RetryMiddleware:
     def _retry_delay(
         self,
         request: ClientRequest,
+        body: object,
         response: ClientResponse,
         ceiling: float,
         deadline: float | None,
@@ -236,7 +258,7 @@ class RetryMiddleware:
         if (
             response.status not in self._statuses
             or request.method not in self._methods
-            or not _can_resend(request)
+            or not _can_resend(request, body)
         ):
             return None
         delay = random.uniform(0.0, ceiling)
@@ -252,7 +274,7 @@ class RetryMiddleware:
         return delay
 
 
-def _can_resend(request: ClientRequest) -> bool:
+def _can_resend(request: ClientRequest, body: object) -> bool:
     """Whether aiohttp sends this request the same way a second time.
 
     Bytes, ``str``, JSON and urlencoded-form bodies are ``BytesPayload`` and
@@ -267,7 +289,7 @@ def _can_resend(request: ClientRequest) -> bool:
     a ``ClientError``.
     """
     return (
-        isinstance(request.body, (bytes, BytesPayload))
+        isinstance(body, (bytes, BytesPayload))
         and request.headers.get(hdrs.EXPECT, "").lower() != "100-continue"
     )
 
