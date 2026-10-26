@@ -89,7 +89,7 @@ class RateLimiter(ABC):
             remaining = timeout - (time.monotonic() - started)
             if delay > remaining:
                 self.release()
-                raise asyncio.TimeoutError(
+                raise TimeoutError(
                     f"rate limiter would delay the request {delay:.3f}s, "
                     f"beyond the {remaining:.3f}s remaining timeout"
                 )
