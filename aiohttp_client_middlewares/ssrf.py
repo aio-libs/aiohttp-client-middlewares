@@ -35,8 +35,8 @@ from yarl import URL
 _IPAddress = IPv4Address | IPv6Address
 _IPNetwork = IPv4Network | IPv6Network
 
-# What a hostname rule may contain once encoded to ASCII: labels of letters,
-# digits, hyphens and underscores, separated by single dots.
+# What a hostname, in a rule or a URL, may contain once encoded to ASCII:
+# labels of letters, digits, hyphens and underscores, separated by single dots.
 _HOSTNAME_RULE = re.compile(r"[a-z0-9_-]+(?:\.[a-z0-9_-]+)*")
 
 # A hostname never ends in a numeric label and an IPv4 address always does,
@@ -155,6 +155,11 @@ def _as_ip_literal(host: str) -> "_IPAddress | None":
         return ip_address(host)
     except ValueError:
         pass
+    # inet_aton stops reading at whitespace, so it would take
+    # "1.2.3.4 x.evil.example" for 1.2.3.4 while the resolver looks up the
+    # whole name; only numeric labels may reach it.
+    if not all(_NUMERIC_LABEL.fullmatch(label) for label in host.split(".")):
+        return None
     try:
         return IPv4Address(socket.inet_aton(host))
     except (OSError, ValueError):
@@ -168,7 +173,10 @@ def _normalize_hostname(host: str) -> str:
     ``host..`` as ``host.``, which is ``host``), and the name is IDNA-encoded
     with yarl, the encoder aiohttp itself uses, so a Unicode rule and the
     punycode host aiohttp connects to compare equal. A host that yarl
-    refuses is returned unchanged, so it matches no hostname rule.
+    refuses comes back unchanged and so matches no hostname rule. For a
+    deny rule that would fail open, because a resolver can read such a name
+    as another host (getaddrinfo stops at a NUL), so the URL check refuses
+    any host that does not come back as a valid hostname.
     """
     host = host.lower().rstrip(".")
     try:
@@ -203,9 +211,9 @@ def _parse_rules(entries: "Iterable[str] | None", what: str) -> _Rules:
 
     A rule that cannot be parsed raises instead of becoming one that never
     matches: a silent no-op in a security rule fails open. An entry with a
-    ``/`` or ``:``, or whose last label is numeric, must be a canonical IP
-    address or CIDR network without host bits; anything else must be a
-    hostname, which is matched exactly.
+    ``/`` or ``:``, or whose last label is numeric as written or once
+    IDNA-encoded, must be a canonical IP address or CIDR network without
+    host bits; anything else must be a hostname, which is matched exactly.
     """
     if entries is None:
         return _Rules(frozenset(), ())
@@ -257,6 +265,15 @@ def _parse_hostname(entry: str) -> str:
         raise ValueError(f"invalid rule entry {entry!r}: {exc}") from None
     if not encoded or not _HOSTNAME_RULE.fullmatch(encoded):
         raise ValueError(f"invalid rule entry {entry!r}")
+    # IDNA folds full-width digits and ideographic dots to ASCII, so an entry
+    # that was no address as written can be one once encoded. As a hostname
+    # it would match no resolved address, and as an address it is not
+    # canonical, so it is refused like "127.1" is.
+    if _NUMERIC_LABEL.fullmatch(encoded.rpartition(".")[2]):
+        raise ValueError(
+            f"invalid rule entry {entry!r}: IDNA turns it into the address "
+            f"{encoded!r}; write addresses in canonical ASCII form"
+        )
     return encoded
 
 
@@ -265,7 +282,8 @@ class SSRFConnector(TCPConnector):
 
     Every request's URL is checked in :meth:`connect`: its scheme against
     ``allowed_schemes``, its host against ``denylist`` and ``allowlist``,
-    and an IP-literal host against the public-only policy. Every address a
+    and an IP-literal host against the public-only policy; a host that is
+    neither an IP address nor a valid hostname is refused. Every address a
     hostname resolves to is checked before aiohttp connects to it, and one
     unsafe address refuses the whole answer. ``exempt_hosts`` names the
     internal hosts or networks that may be reached on purpose.
@@ -325,6 +343,8 @@ class SSRFConnector(TCPConnector):
             raise SSRFError(host, "the URL has no host")
         ip = _as_ip_literal(host)
         name = _normalize_hostname(host)
+        if ip is None and not _HOSTNAME_RULE.fullmatch(name):
+            raise SSRFError(host, "host is not a valid hostname or IP address")
         if name in self._deny.hosts or (
             ip is not None and self._deny.contains(ip, either_form=True)
         ):

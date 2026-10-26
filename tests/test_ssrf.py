@@ -263,6 +263,10 @@ def test_ssrf_error_survives_pickle_and_copy() -> None:
         "0X7F000001",  # hex IPv4, upper case
         "0177.0.0.1",  # octal IPv4
         "127.0.0.1.",  # trailing dot on an address
+        "１６８．６３．１２９．１６",  # full width: IDNA folds it to an address
+        "127。0。0。1",  # ideographic full stops fold to dots
+        "127.0.0.１",  # a full-width last label alone
+        "１２７．１",  # folds to the non-canonical 127.1
         "::ffff:10.0.0.1",  # IPv4-mapped: matched as 10.0.0.1, so write that
         "64:ff9b::/96",  # NAT64: likewise matched as IPv4
     ],
@@ -416,6 +420,26 @@ async def test_undecodable_punycode_host_is_not_an_error() -> None:
 
 
 @pytest.mark.parametrize(
+    ("build", "host"),
+    [
+        # Resolvers stop reading a name at a NUL, so this one is localhost.
+        (lambda: SSRFConnector(denylist=["localhost"]), "localhost\x00.attacker.test"),
+        # inet_aton stops at the space and reads 1.2.3.4, while the resolver
+        # looks up the whole name, which the attacker's DNS answers.
+        (lambda: SSRFConnector(allowlist=["1.2.3.4"]), "1.2.3.4 x.attacker.test"),
+    ],
+    ids=["nul-past-denylist", "space-past-allowlist"],
+)
+async def test_hosts_that_are_not_hostnames_are_refused(
+    build: Callable[[], SSRFConnector], host: str
+) -> None:
+    """A host the rules and the resolver would read differently fails closed."""
+    connector = build()
+    async with connector:
+        _blocked(connector, f"http://{host}/", "not a valid hostname")
+
+
+@pytest.mark.parametrize(
     "host",
     ["victim.com", "VICTIM.COM.", "victim.com..", "victim.com..."],
 )
@@ -474,6 +498,7 @@ async def test_allowlist_admits_only_its_entries() -> None:
         _check(connector, "http://8.8.8.8/")
         _check(connector, "http://[::ffff:8.8.8.8]/")  # the mapped form of 8.8.8.8
         _blocked(connector, "http://other.example.com/", "not on the allowlist")
+        _blocked(connector, "http://8.8.8.8.8/", "not on the allowlist")  # a name
 
 
 @pytest.mark.parametrize("url", ["http://example.com/", "http://8.8.8.8/"])
@@ -564,6 +589,15 @@ async def test_proxied_ip_literals_are_still_judged() -> None:
     async with connector:
         _blocked(connector, "http://127.0.0.1./", "not publicly routable", _PROXY)
         _check(connector, "http://8.8.8.8/", _PROXY)
+
+
+async def test_proxied_host_with_a_space_is_not_an_ip_literal() -> None:
+    """``1.2.3.4 x.attacker.test`` is a name the proxy resolves, not 1.2.3.4."""
+    connector = SSRFConnector()
+    async with connector:
+        _blocked(
+            connector, "http://1.2.3.4 x.attacker.test/", "not a valid hostname", _PROXY
+        )
 
 
 # --- Resolved addresses -------------------------------------------------------

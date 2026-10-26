@@ -216,9 +216,12 @@ and they see the URL after any middleware has rewritten it.
    (``64:ff9b::/96``) addresses are judged, and matched against rules, as the
    IPv4 address they embed, and other spellings of an IPv4 literal
    (``0x7f000001``, ``2130706433``, ``127.1``, ``127.0.0.1.``) as the address
-   they reach. If any address in a DNS answer is refused, the whole request is
-   refused; aiohttp connects only to the addresses checked here, so a second
-   DNS answer cannot swap in another one. A refusal raises :exc:`SSRFError`.
+   they reach. A URL host that is neither an IP address nor a valid hostname,
+   such as one with a NUL or a space in it, is refused: a resolver could read
+   it as a different host than the rules do. If any address in a DNS answer
+   is refused, the whole request is refused; aiohttp connects only to the
+   addresses checked here, so a second DNS answer cannot swap in another one.
+   A refusal raises :exc:`SSRFError`.
 
    Rule entries are exact hostnames or IP addresses and CIDR networks.
    Hostnames are matched case-insensitively, with trailing dots ignored and
