@@ -13,7 +13,6 @@ import asyncio
 import math
 import time
 from abc import ABC, abstractmethod
-from collections import defaultdict
 
 from aiohttp import ClientHandlerType, ClientRequest, ClientResponse
 
@@ -21,39 +20,40 @@ from aiohttp import ClientHandlerType, ClientRequest, ClientResponse
 class RateLimiter(ABC):
     """Base class for rate-limit algorithms.
 
-    Implementations provide the synchronous :meth:`acquire` and
-    :meth:`clone`; the async sleeping and timeout logic live here in
-    :meth:`wait`, shared by every algorithm. Because :meth:`acquire` is
-    synchronous, callers on one event loop reserve slots atomically in
-    arrival order.
+    Implementations provide an async :meth:`acquire` and a synchronous
+    :meth:`clone`. The sleeping, timeout and post-reservation cancellation
+    logic lives in :meth:`wait`, shared by every algorithm, so reserving a
+    slot may perform I/O of its own -- against Redis or a database, say.
 
-    A limiter that needs I/O to reserve a slot -- one backed by Redis or a
-    database, say -- overrides :meth:`wait` rather than :meth:`acquire`:
-    ``wait`` is the only method the middleware calls and is already a
-    coroutine. Such an implementation owns what it takes over: ordering
-    between concurrent callers, charging the round trip against *timeout*,
-    and handing the slot back when the caller goes away.
+    Until :meth:`acquire` returns, cleaning up a half-made reservation is
+    its own responsibility; once it returns, :meth:`wait` owns the slot and
+    calls :meth:`release` if it cannot be used.
 
-    :meth:`acquire` and :meth:`clone` stay abstract either way, so an
-    implementation that overrides :meth:`wait` still has to define both to
-    be instantiable. Its :meth:`acquire` is never called and can simply
-    raise; :meth:`clone` is called for real by ``per_domain=True``.
+    An async method that contains no suspension point still runs atomically
+    when awaited directly. :class:`TokenBucket` relies on that property to
+    preserve arrival ordering on one event loop.
     """
 
     @abstractmethod
-    def acquire(self) -> float:
+    async def acquire(self) -> float:
         """Reserve a slot and return the delay to sleep before sending.
 
-        Must return without awaiting: the arrival-order guarantee above
-        holds precisely because there is no suspension point here.
+        The delay must be non-negative, finite seconds; :meth:`wait` takes that
+        on trust, and a NaN would send the request through unthrottled. If
+        cancellation or another exception prevents this method from
+        returning, it must not leave a reservation behind.
         """
 
     @abstractmethod
-    def clone(self) -> "RateLimiter":
-        """Return a fresh limiter with the same configuration.
+    def clone(self, host: str, /) -> "RateLimiter":
+        """Return a fresh limiter, configured the same, scoped to *host*.
 
-        Per-domain mode clones the configured limiter once per target
-        host, so state (queued slots, accrued tokens) must not carry over.
+        Per-domain mode calls this the first time it meets a host, so state
+        (queued slots, accrued tokens) must not carry over. Threads racing on
+        that first contact may each build one and only one is kept, so the
+        call itself should have no side effects. An algorithm that keeps its
+        state in-process can ignore *host*; one that keeps it in a shared
+        backend needs it in the key, or every host draws on one limit.
         """
 
     def release(self) -> None:
@@ -64,28 +64,35 @@ class RateLimiter(ABC):
         cancelled while sleeping. The default is a no-op for algorithms
         that have nothing to return.
 
-        Runs from an ``except asyncio.CancelledError`` block, so it must
-        not await either: a second cancellation, or the loop shutting
-        down, would truncate it part-way and lose the slot for good.
+        Must neither await nor raise, since one of those calls is from an
+        ``except asyncio.CancelledError`` block: awaiting there can be
+        truncated part-way, and raising would replace the exception the
+        caller is owed. A limiter that has to reach its backend to hand a
+        slot back can schedule that round trip as a task from here.
         """
 
     async def wait(self, timeout: float | None = None) -> None:
-        """Reserve a slot and sleep out its delay.
+        """Reserve a slot and wait until the request may be sent.
 
-        When the delay would exceed *timeout*, the slot is handed back and
-        :exc:`asyncio.TimeoutError` is raised without sleeping, so a
-        request that could never be sent in time fails fast.
-
-        This is the method the middleware calls, and the one to override
-        when reserving a slot needs I/O of its own.
+        Time in :meth:`acquire` is charged against *timeout* once it
+        returns, though not bounded by it, so an implementation that can
+        hang needs its own deadline. When the delay exceeds what is left,
+        the slot is handed back and :exc:`asyncio.TimeoutError` raised
+        without sleeping.
         """
-        delay = self.acquire()
-        if timeout is not None and delay > timeout:
-            self.release()
-            raise asyncio.TimeoutError(
-                f"rate limiter would delay the request {delay:.3f}s, "
-                f"beyond the {timeout:.3f}s timeout"
-            )
+        started = time.monotonic()
+        delay = await self.acquire()
+
+        if timeout is not None:
+            # Goes negative when acquiring alone outlasted the timeout; the
+            # message reports it as such rather than clamping it to zero.
+            remaining = timeout - (time.monotonic() - started)
+            if delay > remaining:
+                self.release()
+                raise TimeoutError(
+                    f"rate limiter would delay the request {delay:.3f}s, "
+                    f"beyond the {remaining:.3f}s remaining timeout"
+                )
         if delay > 0.0:
             try:
                 await asyncio.sleep(delay)
@@ -131,18 +138,23 @@ class TokenBucket(RateLimiter):
         )
         self._last_refill = now
 
-    def acquire(self) -> float:
+    async def acquire(self) -> float:
         """Take one token and return the delay to sleep before sending.
 
         The delay is the exact fractional deficit (not rounded to whole
         intervals), so a caller never waits longer than the bucket needs.
+        There is deliberately no suspension point: callers on one event
+        loop reserve slots atomically, in arrival order.
         """
         self._refill()
         self._tokens -= 1.0
         return max(0.0, -self._tokens) * self._interval
 
-    def clone(self) -> "TokenBucket":
-        """Return a fresh, full bucket with the same rate and burst."""
+    def clone(self, host: str, /) -> "TokenBucket":
+        """Return a fresh, full bucket with the same rate and burst.
+
+        The bucket's state is per-object, so *host* needs no part in it.
+        """
         return TokenBucket(rate=self._rate, burst=int(self._burst))
 
     def release(self) -> None:
@@ -155,13 +167,16 @@ class RateLimitMiddleware:
     """Client middleware that throttles requests through a :class:`RateLimiter`.
 
     The middleware waits on the limiter before sending, so the client never
-    sends faster than the limiter allows and slots are granted in arrival
-    order. Cancellation is the one exception: a slot handed back by
-    :meth:`RateLimiter.release` frees capacity that queued callers have
-    already been given fixed delays against, so two of them can briefly
-    send in the same instant. A wait that would exceed the request's total
-    timeout fails immediately with :exc:`asyncio.TimeoutError` instead of
-    sleeping toward a guaranteed timeout.
+    sends faster than the limiter allows. What that ordering is worth is the
+    limiter's to say. :class:`TokenBucket` grants slots in arrival order
+    because its :meth:`~RateLimiter.acquire` has no suspension point.
+
+    For :class:`TokenBucket`, cancellation is the one exception to arrival
+    order: a handed-back slot frees capacity that queued callers have already
+    been given fixed delays against, so two of them can briefly send in the
+    same instant. A wait that would exceed the request's total timeout fails
+    immediately with :exc:`asyncio.TimeoutError` instead of sleeping toward a
+    guaranteed timeout.
 
     Middleware order matters: middlewares listed earlier wrap the ones listed
     later, and a middleware that retries internally (for example,
@@ -173,7 +188,7 @@ class RateLimitMiddleware:
     :param RateLimiter limiter: The :class:`RateLimiter` to throttle with --
         for example ``TokenBucket(rate=5.0, burst=2)``. With
         ``per_domain=True`` it acts as a template: each target host gets
-        ``limiter.clone()`` the first time that host is seen.
+        ``limiter.clone(host)`` the first time that host is seen.
     :param bool per_domain: When ``True``, keep an independent limiter per
         target host instead of a single global one. Limiters are keyed on the
         URL host only (port and scheme are not distinguished) and are never
@@ -189,31 +204,39 @@ class RateLimitMiddleware:
     ) -> None:
         if not isinstance(limiter, RateLimiter):
             raise TypeError(f"limiter must be a RateLimiter, got {limiter!r}")
-        self._per_domain = per_domain
-        self._global_limiter: RateLimiter | None = None
-        if per_domain:
-            self._domain_limiters: dict[str, RateLimiter] = defaultdict(limiter.clone)
-        else:
-            self._global_limiter = limiter
+        # The one limiter in global mode; the template to clone in per-domain
+        # mode. Whether the per-host dict exists is what says which.
+        self._limiter = limiter
+        self._domain_limiters: dict[str, RateLimiter] | None = (
+            {} if per_domain else None
+        )
 
     @property
     def per_domain(self) -> bool:
         """Whether this middleware keeps one limiter per target host.
 
-        Read-only: the limiters are built once in ``__init__``, so flipping
-        this afterwards could not take effect.
+        Read-only: which limiter a request gets is decided in ``__init__``,
+        so flipping this afterwards could not take effect.
         """
-        return self._per_domain
+        return self._domain_limiters is not None
 
     def _get_limiter(self, request: ClientRequest) -> RateLimiter:
-        if self._global_limiter is not None:
-            return self._global_limiter
+        limiters = self._domain_limiters
+        if limiters is None:
+            return self._limiter
         # aiohttp raises InvalidUrlClientError for host-less URLs before
         # any middleware runs (on redirects too), so ``host`` is only
         # ``None`` in the type; the assert narrows it for mypy.
         domain = request.url.host
         assert domain is not None
-        return self._domain_limiters[domain]
+        limiter = limiters.get(domain)
+        if limiter is None:
+            # setdefault, not an assignment: threads racing for a host they
+            # have not seen before must all leave with the limiter that was
+            # stored, or each gets a private full budget and the burst
+            # allowance is briefly multiplied by the number of racers.
+            limiter = limiters.setdefault(domain, self._limiter.clone(domain))
+        return limiter
 
     async def __call__(
         self,
@@ -222,5 +245,10 @@ class RateLimitMiddleware:
     ) -> ClientResponse:
         """Run the request through the rate limiter."""
         limiter = self._get_limiter(request)
-        await limiter.wait(request.timeout.total)
+        total = request.timeout.total
+        if total is not None and total <= 0.0:
+            # aiohttp arms its own deadline only for a positive total, so a
+            # zero or negative one means "no timeout", not "no budget left".
+            total = None
+        await limiter.wait(total)
         return await handler(request)

@@ -82,37 +82,65 @@ Rate limiting
 
 .. class:: RateLimiter()
 
-   Abstract base class for rate-limit algorithms. Implementations provide the
-   synchronous ``acquire()``, which reserves a slot and returns the delay, in
-   seconds, to sleep before sending, and ``clone()``, which returns a fresh
-   limiter with the same configuration (used once per host by per-domain
-   mode). The async ``wait(timeout=None)`` method is shared by all
-   implementations: it acquires a slot, fails fast with
-   :exc:`asyncio.TimeoutError` -- handing the slot back -- when the delay
-   would exceed *timeout*, sleeps out the delay otherwise, and hands the slot
-   back if the caller is cancelled mid-sleep. ``release()`` defaults to a
-   no-op for algorithms that have nothing to return.
+   Abstract base class for rate-limit algorithms, and the type
+   :class:`RateLimitMiddleware` accepts. Implementations provide async
+   ``acquire()``, which reserves a slot and returns its delay as a non-negative
+   finite number of seconds -- ``wait()`` takes that on trust -- and
+   ``clone(host)``, which returns a fresh limiter with the same configuration
+   scoped to one host (called when per-domain mode first meets a host; a
+   racing thread's extra clone is discarded, so it should have no side
+   effects)::
 
-   Neither ``acquire()`` nor ``release()`` may await. Their being synchronous
-   is what reserves slots atomically, in arrival order, across concurrent
-   callers on one event loop, and ``release()`` additionally runs from a
-   cancellation handler, where an awaiting implementation can be truncated
-   and lose the slot. A limiter that needs I/O to reserve a slot -- one
-   backed by Redis or a database, say -- overrides ``wait()`` instead: it is
-   the only method the middleware calls and is already a coroutine. Such an
-   implementation takes on ordering between concurrent callers, charging its
-   round trip against *timeout*, and returning the slot when the caller goes
-   away. ``acquire()`` and ``clone()`` are abstract either way, so it still
-   has to define both to be instantiable; its ``acquire()`` is never called
-   and can simply raise, while ``clone()`` is used for real by
-   ``per_domain=True``.
+       class RedisLimiter(RateLimiter):
+           def __init__(self, redis, key, script):
+               self._redis, self._key, self._script = redis, key, script
+
+           async def acquire(self):
+               # An atomic script reserves the next slot and returns the delay
+               # in milliseconds: Redis turns Lua numbers into integers, so a
+               # fractional second cannot come back as one.
+               ms = await self._redis.evalsha(self._script, 1, self._key)
+               return ms / 1000
+
+           def clone(self, host):
+               return RedisLimiter(self._redis, f"{self._key}:{host}", self._script)
+
+   Putting *host* in the key is what makes ``per_domain=True`` mean a budget
+   per host for a shared backend; a limiter that keeps its state in-process,
+   like :class:`TokenBucket`, has nothing to key and can ignore it. Redirects
+   pick hosts too, so give those keys an expiry of their own rather than let a
+   shared backend keep one for every host ever seen. The sketch also leaves
+   ``release()`` at the default no-op, and a cancelled round trip can leave a
+   reservation nobody holds; an expiry on each reservation covers both.
+
+   ``wait(timeout=None)`` is supplied by the base class. It charges async
+   acquisition against *timeout* once ``acquire()`` returns -- without bounding
+   the call itself, so an implementation that can hang needs its own deadline --
+   then fails fast when the delay exceeds what is left, sleeps otherwise, and
+   calls ``release()`` if an acquired slot cannot be used. ``release()`` defaults
+   to a no-op for algorithms with nothing to return, and stays synchronous: one
+   of those calls is from a cancellation handler, where awaiting can be truncated
+   part-way and lose the slot for good, and raising would replace the exception
+   the caller is owed. A limiter that has to reach its backend to hand a slot
+   back can schedule that round trip as a task.
+
+   ``acquire()`` must be cancellation-safe: if cancellation or another
+   exception prevents it from returning, it must leave no reservation behind.
+   Once it returns successfully, ``wait()`` owns that cleanup. A backend whose
+   reservation can outlive a cancelled network operation should use an
+   idempotency key, transaction, or expiry so interrupted acquisition cannot
+   leak capacity.
+
+   An async ``acquire()`` with no suspension point still reserves atomically
+   across callers on one event loop. An implementation that performs I/O
+   determines its own ordering at those suspension points.
 
 .. class:: TokenBucket(rate=10.0, burst=10)
 
    A :class:`RateLimiter`: tokens accrue continuously at ``rate`` per second,
-   capped at ``burst``; ``acquire()`` takes one token and the count may go
-   negative, which is what queues callers up in arrival order. The bucket
-   holds no tasks or loop state.
+   capped at ``burst``; async ``acquire()`` takes one token and the count may
+   go negative, which is what queues callers up in arrival order. It contains
+   no suspension point and the bucket holds no tasks or loop state.
 
    :param float rate: Token accrual rate, in tokens per second. Must be a
       positive, finite number.
@@ -126,7 +154,7 @@ Rate limiting
 
    :param RateLimiter limiter: The :class:`RateLimiter` to throttle with --
       for example ``TokenBucket(rate=5.0, burst=2)``. With ``per_domain=True``
-      it acts as a template: each target host gets ``limiter.clone()`` the
+      it acts as a template: each target host gets ``limiter.clone(host)`` the
       first time that host is seen.
    :param bool per_domain: Keep an independent limiter per target host instead
       of a single global one. Limiters are keyed on the URL host only (port
@@ -137,13 +165,15 @@ Rate limiting
    :raises TypeError: if ``limiter`` is not a :class:`RateLimiter`.
 
    The middleware waits on the limiter before sending, so the client never
-   sends faster than the limiter allows and slots are granted in arrival
-   order. Cancellation is the one exception: a slot handed back by
-   ``release()`` frees capacity that queued callers already hold fixed delays
-   against, so two of them can briefly send in the same instant. A wait that
-   would exceed the request's total timeout fails immediately with
-   :exc:`asyncio.TimeoutError` instead of sleeping toward a guaranteed
-   timeout.
+   sends faster than the limiter allows. What that ordering is worth is the
+   limiter's to say: :class:`TokenBucket` grants slots in arrival order because
+   its async ``acquire()`` does not suspend, while an I/O-backed limiter orders
+   callers according to its backend. For :class:`TokenBucket`, cancellation is
+   the one exception: a slot handed back by ``release()`` frees capacity that
+   queued callers already hold fixed delays against, so two of them can
+   briefly send in the same instant. A wait that would exceed the request's
+   total timeout fails immediately with :exc:`asyncio.TimeoutError` instead
+   of sleeping toward a guaranteed timeout.
 
    Middleware order matters: middlewares listed earlier wrap the ones listed
    later, and a middleware that retries internally (for example,

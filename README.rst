@@ -49,7 +49,7 @@ This requires ``aiohttp >= 3.15`` (for the read-only ``ClientRequest.timeout``
 attribute ``RateLimitMiddleware`` reads each request's budget from) and
 ``yarl >= 1.17.0``. Both are pulled in automatically.
 
-Supported Python versions: 3.10, 3.11, 3.12, 3.13 and 3.14.
+Supported Python versions: 3.11, 3.12, 3.13, 3.14 and 3.15.
 
 
 Quickstart
