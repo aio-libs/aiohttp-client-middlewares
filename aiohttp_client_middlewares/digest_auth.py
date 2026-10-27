@@ -11,7 +11,6 @@ SHA-512, SHA-512-256 and their session variants -- as well as both 'auth' and
 import hashlib
 import os
 import re
-import sys
 import time
 from typing import Final, Literal, TypedDict
 
@@ -59,9 +58,7 @@ def _resolve_hash_name(algorithm: str) -> str:
 
 # Compile the regex pattern once at module level for performance
 _HEADER_PAIRS_PATTERN = re.compile(
-    r'(?:^|\s|,\s*)(\w+)(?:\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^\s,]+)))?'
-    if sys.version_info < (3, 11)
-    else r'(?:^|\s|,\s*)((?>\w+))(?:\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^\s,]+)))?'
+    r'(?:^|\s|,\s*)((?>\w+))(?:\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^\s,]+)))?'
     # +------------|--------|--|--||--|--|----|------|---|---||-----|-> Match valid start/sep
     #              +--------|--|--||--|--|----|------|---|---||-----|-> alphanumeric key (atomic group reduces backtracking)
     #                       +--|--||--|--|----|------|---|---||-----|-> optional value; absent => bare auth-scheme token
