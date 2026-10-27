@@ -1,0 +1,3 @@
+Added :class:`~aiohttp_client_middlewares.RetryMiddleware`, for retrying
+requests after transient failures with a jittered exponential backoff and
+``Retry-After`` support -- by :user:`rodrigobnogueira`.
