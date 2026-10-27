@@ -1,0 +1,7 @@
+Added :class:`~aiohttp_client_middlewares.SSRFConnector`, which protects a
+session against server-side request forgery: it refuses to connect to
+non-public addresses, whether written in the URL or returned by DNS, on
+every request and redirect hop, and applies URL allow and deny rules.
+:exc:`~aiohttp_client_middlewares.SSRFError` and
+:func:`~aiohttp_client_middlewares.is_unsafe_address` were added with it
+-- by :user:`rodrigobnogueira`.

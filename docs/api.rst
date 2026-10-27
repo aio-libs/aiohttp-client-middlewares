@@ -191,3 +191,112 @@ Rate limiting
       :pyobject: rate_limit_usage
       :lines: 2-
       :dedent:
+
+SSRF protection
+---------------
+
+:class:`SSRFConnector` protects a session against server-side request forgery
+(SSRF): pass it as the session's ``connector``. It refuses to connect to any
+address that is not publicly routable, judging IP literals in the URL and every
+address a hostname resolves to, and it applies URL rules. Because the checks
+run in the connector, they cover every request, redirect hop and
+``ws_connect()``, a request-level ``middlewares=`` argument cannot skip them,
+and they see the URL after any middleware has rewritten it.
+
+.. class:: SSRFConnector(*, allowlist=None, denylist=None, exempt_hosts=None, allowed_schemes=("http", "https", "ws", "wss"), trust_proxy=False, **kwargs)
+
+   A :class:`~aiohttp.TCPConnector` that refuses to reach non-public
+   addresses.
+
+   Loopback, private, link-local, site-local, multicast, reserved,
+   unspecified and other non-global addresses are refused, as are
+   carrier-grade NAT, IETF protocol assignments (``192.0.0.0/24``), 6to4 relay
+   anycast (``192.88.99.0/24``), NAT64 local-use, 6to4 and Teredo ranges and
+   the RFC 9637 documentation range. IPv4-mapped (``::ffff:0:0/96``) and NAT64
+   (``64:ff9b::/96``) addresses are judged, and matched against rules, as the
+   IPv4 address they embed, and other spellings of an IPv4 literal
+   (``0x7f000001``, ``2130706433``, ``127.1``, ``127.0.0.1.``) as the address
+   they reach. A URL host that is neither an IP address nor a valid hostname,
+   such as one with a NUL or a space in it, is refused: a resolver could read
+   it as a different host than the rules do. If any address in a DNS answer
+   is refused, the whole request is refused; aiohttp connects only to the
+   addresses checked here, so a second DNS answer cannot swap in another one.
+   A refusal raises :exc:`SSRFError`.
+
+   Rule entries are exact hostnames or IP addresses and CIDR networks.
+   Hostnames are matched case-insensitively, with trailing dots ignored and
+   IDNA normalized; there is no suffix or wildcard matching, so list each
+   host. A malformed entry raises :exc:`ValueError` at construction rather than
+   becoming a rule that never matches.
+
+   :param allowlist: When given, the URL host must match one of these entries,
+      and everything else is refused. ``None`` disables the check; an empty
+      list refuses every request. The allowlist only narrows: an allowlisted
+      internal address is still refused unless ``exempt_hosts`` covers it.
+   :type allowlist: ~collections.abc.Iterable[str] | None
+   :param denylist: URL hosts that are refused; checked before anything else.
+      Network entries also apply to every resolved address, so a hostname that
+      resolves into a denied network is refused too. Use them for sensitive
+      addresses that are public, such as a cloud provider's platform address.
+   :type denylist: ~collections.abc.Iterable[str] | None
+   :param exempt_hosts: Internal hosts or networks that may be reached on
+      purpose. A hostname exempts whatever it resolves to; an address or
+      network exempts addresses inside it. Exemptions apply to every request
+      made through the connector, untrusted URLs and redirect targets
+      included, and a network exemption admits every hostname that resolves
+      into it, so prefer hostnames, and prefer a separate session for
+      internal services.
+   :type exempt_hosts: ~collections.abc.Iterable[str] | None
+   :param allowed_schemes: URL schemes that may be requested. aiohttp's
+      :class:`~aiohttp.TCPConnector` also accepts ``tcp://`` and scheme-less
+      URLs, which the default leaves out. Use ``("https", "wss")`` to require
+      TLS.
+   :type allowed_schemes: ~collections.abc.Iterable[str]
+   :param bool trust_proxy: Behind a forward proxy the connector sees only the
+      proxy, never what the target resolves to. A proxied request to a
+      hostname is therefore refused unless the host is allowlisted or exempt.
+      Set ``trust_proxy=True`` when the proxy itself refuses internal targets,
+      as an egress proxy such as Smokescreen does. Literal-IP targets are
+      checked either way.
+   :raises ValueError: for a malformed rule entry.
+   :raises TypeError: if a bare string is passed instead of an iterable, or a
+      rule entry is not a string.
+
+   A proxy is used when ``proxy=`` is given to the session, a request or
+   ``ws_connect()``, or with ``trust_env=True`` when ``HTTP_PROXY``,
+   ``HTTPS_PROXY``, ``WS_PROXY`` or ``WSS_PROXY`` is set or, on macOS and
+   Windows, a system proxy is configured. A proxy on an internal address is
+   refused like any other host, so exempt it by hostname, and put the same
+   name on the ``denylist`` so the proxy itself cannot be requested as a
+   target.
+
+   Every other keyword argument is passed to :class:`~aiohttp.TCPConnector`.
+
+.. function:: is_unsafe_address(address)
+
+   Return ``True`` unless *address* is a public, globally-routable IP. Accepts
+   a string or an :class:`~ipaddress.IPv4Address`/:class:`~ipaddress.IPv6Address`;
+   a string that does not parse as an IP address is unsafe (fail closed), and
+   any other type raises :exc:`TypeError`. This is the classification
+   :class:`SSRFConnector` starts from, without any of its rules; new releases
+   may classify more addresses as unsafe. It cannot protect a custom
+   resolver on its own, because aiohttp does not call the resolver for
+   IP-literal hosts.
+
+.. exception:: SSRFError(host, reason, address=None)
+
+   Raised when a request is blocked; a subclass of :exc:`aiohttp.ClientError`.
+   ``host`` is the blocked host in its ASCII (punycode) form, ``reason`` says
+   why, and ``address`` is the refused resolved address when a DNS answer was
+   the reason. The address is left out of the message, so the message can be
+   shown to users without revealing internal addresses.
+
+   A block is a policy decision, not a network failure: do not retry it, and
+   catch it before any generic ``except aiohttp.ClientError``.
+
+**Usage**
+
+.. literalinclude:: code/api.py
+   :pyobject: ssrf_usage
+   :lines: 2-
+   :dedent:
