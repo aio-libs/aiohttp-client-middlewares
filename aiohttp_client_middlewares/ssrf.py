@@ -52,7 +52,7 @@ _IPV4_EMBEDDING_NETWORKS: tuple[IPv6Network, ...] = (
 
 # Ranges that must be blocked but that ``ipaddress`` calls global on some or
 # all supported CPythons (several only before the CVE-2024-4032 fix in
-# 3.10.15, 3.11.10 and 3.12.4), so the result is the same on every version.
+# 3.11.10 and 3.12.4), so the result is the same on every version.
 _EXTRA_BLOCKED_NETWORKS: tuple[_IPNetwork, ...] = (
     ip_network("100.64.0.0/10"),  # carrier-grade NAT (RFC 6598)
     ip_network("192.0.0.0/24"),  # IETF protocol assignments (RFC 6890)
