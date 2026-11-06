@@ -5,6 +5,7 @@ from aiohttp import ClientSession
 from aiohttp_client_middlewares import (
     DigestAuthMiddleware,
     RateLimitMiddleware,
+    SSRFConnector,
     TokenBucket,
 )
 
@@ -25,3 +26,10 @@ async def rate_limit_example() -> None:
         async with session.get("http://example.com") as resp:
             resp.raise_for_status()
             print(await resp.text())
+
+
+async def ssrf_example() -> None:
+    # The connector checks every URL and every address a hostname resolves to.
+    async with ClientSession(connector=SSRFConnector()) as session:
+        async with session.get("https://example.com") as resp:
+            print("Status:", resp.status)
